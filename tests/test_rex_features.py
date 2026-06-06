@@ -100,6 +100,12 @@ class TestConfigDefaults(unittest.TestCase):
             cfg = app_mod.load_config()
         self.assertEqual(cfg["ocr_hotkey"], app_mod.OCR_HOTKEY)
 
+    def test_defaults_include_toolbar_settings(self):
+        with mock.patch.object(app_mod.os.path, "exists", return_value=False):
+            cfg = app_mod.load_config()
+        self.assertEqual(cfg["toolbar_alpha"], app_mod.DEFAULT_TOOLBAR_ALPHA)
+        self.assertTrue(cfg["toolbar_visible"])
+
     def test_save_load_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
@@ -260,18 +266,30 @@ class TestToolbarGeometry(unittest.TestCase):
             bar._root = root
             bar.W = app_mod.FloatingStatusBar.W
             bar.H = app_mod.FloatingStatusBar.H
+            bar._rest_alpha = 0.5
+            bar._hover_alpha = 1.0
+            bar._visible = True
+            bar._ocr_hidden = False
+            bar._hovering = False
             root.geometry(f"{bar.W}x{bar.H}+100+100")
-            root.attributes("-alpha", 0.95)
+            root.attributes("-alpha", 0.5)
             root.update_idletasks()
             bar.prepare_for_ocr_overlay()
             bar.restore_after_ocr_overlay()
-            ok["v"] = root.geometry().startswith(f"{bar.W}x{bar.H}+")
+            ok["v"] = (
+                root.geometry().startswith(f"{bar.W}x{bar.H}+")
+                and abs(float(root.attributes("-alpha")) - 0.5) < 0.01
+            )
             root.destroy()
             done.set()
 
         threading.Thread(target=run, daemon=True).start()
         self.assertTrue(done.wait(10))
         self.assertTrue(ok["v"])
+
+    def test_clamp_toolbar_alpha_default(self):
+        self.assertEqual(app_mod.clamp_toolbar_alpha(0.5), 0.5)
+        self.assertEqual(app_mod.clamp_toolbar_alpha("bad"), app_mod.DEFAULT_TOOLBAR_ALPHA)
 
 
 class TestClipboardHelpers(unittest.TestCase):

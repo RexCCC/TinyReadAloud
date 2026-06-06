@@ -65,6 +65,10 @@ DEFAULT_REPHRASE_STYLE = "Natural"
 DEFAULT_STYLE_HOTKEYS = {s: "" for s in REPHRASE_STYLES}
 RECALL_STYLE_HOTKEY = ""
 DEFAULT_MIC_DEVICE = ""  # empty = system default
+DEFAULT_TOOLBAR_ALPHA = 0.5
+DEFAULT_TOOLBAR_VISIBLE = True
+TOOLBAR_ALPHA_MIN = 0.15
+TOOLBAR_ALPHA_HOVER = 1.0
 COPY_WAIT_INTERVAL = 0.02
 COPY_WAIT_TIMEOUT = 1.5
 AUDIO_CHUNK_SECS = 0.05  # 50ms playback granularity for stop responsiveness
@@ -278,6 +282,18 @@ def clamp_speed(value) -> float:
     return max(SPEED_MIN, min(SPEED_MAX, round(float(value), 2)))
 
 
+def clamp_toolbar_alpha(value) -> float:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TOOLBAR_ALPHA
+    return max(TOOLBAR_ALPHA_MIN, min(1.0, round(val, 2)))
+
+
+def toolbar_alpha_percent(value) -> int:
+    return int(round(clamp_toolbar_alpha(value) * 100))
+
+
 def preset_index(value: float) -> int:
     v = clamp_speed(value)
     best_i = 0
@@ -308,7 +324,9 @@ def load_config():
                 "recall_style_hotkey": RECALL_STYLE_HOTKEY,
                 "mic_device": DEFAULT_MIC_DEVICE,
                 "anthropic_api_key": "",
-                "anthropic_model": ANTHROPIC_MODEL_DEFAULT}
+                "anthropic_model": ANTHROPIC_MODEL_DEFAULT,
+                "toolbar_alpha": DEFAULT_TOOLBAR_ALPHA,
+                "toolbar_visible": DEFAULT_TOOLBAR_VISIBLE}
     if not os.path.exists(CONFIG_PATH):
         return defaults
     try:
@@ -826,7 +844,10 @@ class FloatingStatusBar:
         with cls._instance_lock:
             if cls._instance is not None:
                 try:
-                    cls._instance._root.lift()
+                    if not cls._instance._visible:
+                        cls._instance.show_bar()
+                    else:
+                        cls._instance._root.lift()
                     return
                 except Exception:
                     pass
@@ -857,6 +878,13 @@ class FloatingStatusBar:
         self._pill_read = self._pill_ocr = None
         self._canvas = None
         self._context_menu = None
+        self._rest_alpha = clamp_toolbar_alpha(
+            getattr(app, "_toolbar_alpha", DEFAULT_TOOLBAR_ALPHA)
+        )
+        self._hover_alpha = TOOLBAR_ALPHA_HOVER
+        self._visible = bool(getattr(app, "_toolbar_visible", DEFAULT_TOOLBAR_VISIBLE))
+        self._ocr_hidden = False
+        self._hovering = False
         try:
             self._style_idx = REPHRASE_STYLES.index(app._rephrase_style)
         except (ValueError, AttributeError):
@@ -912,12 +940,99 @@ class FloatingStatusBar:
             return f"+{(sw - self.W) // 2}+48"
         return "+0+48"
 
+    def _apply_alpha(self, alpha: float):
+        if not self._root or not self._visible or self._ocr_hidden:
+            return
+        try:
+            self._root.attributes("-alpha", clamp_toolbar_alpha(alpha))
+        except Exception:
+            pass
+
+    def _on_bar_enter(self, _event=None):
+        self._hovering = True
+        self._apply_alpha(self._hover_alpha)
+
+    def _on_bar_leave(self, _event=None):
+        self._hovering = False
+        self._apply_alpha(self._rest_alpha)
+
+    def set_rest_alpha(self, alpha: float):
+        """Update idle transparency (from Settings)."""
+        self._rest_alpha = clamp_toolbar_alpha(alpha)
+        self._app._toolbar_alpha = self._rest_alpha
+        if self._root and not self._hovering and not self._ocr_hidden:
+            self._apply_alpha(self._rest_alpha)
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def hide_bar(self, persist=True):
+        """Hide toolbar (X button or tray)."""
+        self._visible = False
+        if self._root:
+            try:
+                self._root.after(0, lambda: self._do_hide(persist))
+            except Exception:
+                self._do_hide(persist)
+        elif persist:
+            self._persist_visible(False)
+
+    def _do_hide(self, persist=True):
+        try:
+            self._saved_pos = self._parse_geometry_pos(self._root.geometry())
+            self._root.withdraw()
+        except Exception:
+            pass
+        if persist:
+            self._persist_visible(False)
+            try:
+                self._app._refresh_menu()
+            except Exception:
+                pass
+
+    def show_bar(self, persist=True):
+        """Show toolbar again (tray menu)."""
+        self._visible = True
+        if self._root:
+            try:
+                self._root.after(0, lambda: self._do_show(persist))
+            except Exception:
+                self._do_show(persist)
+        if persist:
+            self._persist_visible(True)
+
+    def _do_show(self, persist=True):
+        try:
+            pos = getattr(self, "_saved_pos", None) or self._parse_geometry_pos("")
+            self._root.geometry(f"{self.W}x{self.H}{pos}")
+            self._root.deiconify()
+            self._root.lift()
+            self._apply_alpha(self._hover_alpha if self._hovering else self._rest_alpha)
+        except Exception:
+            pass
+        if persist:
+            self._persist_visible(True)
+            try:
+                self._app._refresh_menu()
+            except Exception:
+                pass
+
+    def _persist_visible(self, visible: bool):
+        self._app._toolbar_visible = visible
+        try:
+            cfg = load_config()
+            cfg["toolbar_visible"] = visible
+            save_config(cfg)
+        except Exception:
+            pass
+
     def prepare_for_ocr_overlay(self):
         """Hide toolbar visually without withdraw (avoids shrink on restore)."""
         if not self._root:
             return
         try:
             self._saved_pos = self._parse_geometry_pos(self._root.geometry())
+            self._ocr_hidden = True
             self._root.attributes("-alpha", 0.0)
         except Exception:
             pass
@@ -927,10 +1042,14 @@ class FloatingStatusBar:
         if not self._root:
             return
         try:
+            self._ocr_hidden = False
+            if not self._visible:
+                self._root.withdraw()
+                return
             pos = getattr(self, "_saved_pos", None) or self._parse_geometry_pos("")
             self._root.geometry(f"{self.W}x{self.H}{pos}")
             self._root.update_idletasks()
-            self._root.attributes("-alpha", 0.95)
+            self._apply_alpha(self._hover_alpha if self._hovering else self._rest_alpha)
             self._root.lift()
         except Exception:
             pass
@@ -999,6 +1118,9 @@ class FloatingStatusBar:
         idx = max(0, min(len(SPEED_PRESETS) - 1, idx + delta))
         self._app.set_reading_speed(SPEED_PRESETS[idx])
 
+    def _tb_close(self, _=None):
+        self.hide_bar()
+
     def _build_context_menu(self):
         menu = tk.Menu(
             self._root, tearoff=0,
@@ -1033,6 +1155,10 @@ class FloatingStatusBar:
             )
         menu.add_cascade(label="Speed", menu=speed_menu)
         menu.add_separator()
+        if self._visible:
+            menu.add_command(label="Hide Toolbar", command=self._tb_close)
+        else:
+            menu.add_command(label="Show Toolbar", command=lambda: self.show_bar())
         menu.add_command(label="Settings…", command=self._open_settings)
         self._context_menu = menu
         return menu
@@ -1202,7 +1328,7 @@ class FloatingStatusBar:
         self._root = root
         root.overrideredirect(True)
         root.wm_attributes("-topmost", True)
-        root.wm_attributes("-alpha", 0.95)
+        root.wm_attributes("-alpha", self._rest_alpha)
         root.wm_attributes("-transparentcolor", T)
         root.configure(bg=T)
         root.resizable(False, False)
@@ -1359,7 +1485,11 @@ class FloatingStatusBar:
 
         btn_gear = _lbl("⚙", font=("Segoe UI", 11), fg=self.DIM, cursor="hand2", parent=right)
         self._bind_btn(btn_gear, self._open_settings, default_fg=self.DIM, hover_fg=self.ACCENT)
-        btn_gear.pack(side=tk.RIGHT, padx=(6, 0))
+        btn_gear.pack(side=tk.RIGHT, padx=(6, 2))
+
+        btn_close = _lbl("✕", font=("Segoe UI", 10), fg=self.DIM, cursor="hand2", parent=right)
+        self._bind_btn(btn_close, self._tb_close, default_fg=self.DIM, hover_fg=self.GEM_ROSE)
+        btn_close.pack(side=tk.RIGHT, padx=(0, 0))
 
         self._style_var = tk.StringVar(value=REPHRASE_STYLES[self._style_idx])
         lbl_style = _lbl(textvariable=self._style_var, font=self._FONTB, fg=self.ACCENT2,
@@ -1395,7 +1525,7 @@ class FloatingStatusBar:
         self._btn_spd_down.pack(side=tk.RIGHT)
 
         for w in (bar, left, right, speed_box, speed_inner, lbl_status, lbl_style, btn_gear,
-                  lbl_speed, self._btn_read, self._btn_ocr, self._pill_read, self._pill_ocr):
+                  btn_close, lbl_speed, self._btn_read, self._btn_ocr, self._pill_read, self._pill_ocr):
             try:
                 w.configure(takefocus=0)
             except Exception:
@@ -1413,6 +1543,9 @@ class FloatingStatusBar:
 
         root.attributes("-topmost", True)
 
+        root.bind("<Enter>", self._on_bar_enter)
+        root.bind("<Leave>", self._on_bar_leave)
+
         # drag on background + status label
         for w in (canvas, lbl_status):
             w.bind("<ButtonPress-1>", self._drag_start)
@@ -1420,7 +1553,7 @@ class FloatingStatusBar:
 
         self._build_context_menu()
         drag_widgets = (
-            canvas, lbl_status, lbl_style, btn_gear,
+            canvas, lbl_status, lbl_style, btn_gear, btn_close,
             self._btn_read, self._btn_pause, self._btn_resume, self._btn_stop,
             self._btn_prev, self._btn_next, self._btn_back, self._btn_fwd,
             self._btn_ocr, self._btn_spd_down, self._btn_spd_up, lbl_speed,
@@ -1430,6 +1563,8 @@ class FloatingStatusBar:
             self._bind_context_menu(w)
 
         self._refresh_playback_ui()
+        if not self._visible:
+            root.withdraw()
         root.protocol("WM_DELETE_WINDOW", lambda: None)
         root.mainloop()
 
@@ -1743,6 +1878,30 @@ class SettingsWindow:
         self._add_record_btn(sec, lambda: self._start_hotkey_record("recall_style"), r)
         self._add_clear_btn(sec, self._recall_style_hotkey_var, r)
 
+        # ── Floating Toolbar ──
+        sec = self._make_section(right_col, "Floating Toolbar")
+        r = 0
+        self._add_label(sec, "Idle opacity", r)
+        alpha_pct = toolbar_alpha_percent(self._app._toolbar_alpha)
+        self._toolbar_alpha_pct_var = tk.IntVar(value=alpha_pct)
+        self._toolbar_alpha_label_var = tk.StringVar(value=f"{alpha_pct}%")
+        alpha_row = tk.Frame(sec, bg=self.BG2)
+        alpha_row.grid(row=r, column=1, columnspan=3, sticky="ew", padx=4, pady=3)
+        alpha_scale = tk.Scale(
+            alpha_row, from_=toolbar_alpha_percent(TOOLBAR_ALPHA_MIN), to=100,
+            orient=tk.HORIZONTAL, variable=self._toolbar_alpha_pct_var,
+            bg=self.BG2, fg=self.FG, troughcolor=self.ENTRY_BG,
+            highlightthickness=0, sliderrelief="flat", showvalue=False,
+            command=self._on_toolbar_alpha_preview,
+        )
+        alpha_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(alpha_row, textvariable=self._toolbar_alpha_label_var,
+                 font=("Segoe UI", 9), bg=self.BG2, fg=self.DIM, width=5).pack(
+            side=tk.RIGHT, padx=(6, 0))
+        tk.Label(sec, text="Hover = 100% opaque", font=("Segoe UI", 8),
+                 bg=self.BG2, fg=self.DIM).grid(
+            row=r + 1, column=1, columnspan=3, sticky="w", padx=4, pady=(0, 4))
+
         # ══════════════════════════════════════════════════════════════════════
         # Buttons
         # ══════════════════════════════════════════════════════════════════════
@@ -1880,6 +2039,13 @@ class SettingsWindow:
         self._app.tts.set_speed(speed)
         self._app.tts.speak_preview("Hello! This is a preview.", code, "en-us")
 
+    def _on_toolbar_alpha_preview(self, value):
+        pct = int(float(value))
+        self._toolbar_alpha_label_var.set(f"{pct}%")
+        sb = FloatingStatusBar.get()
+        if sb:
+            sb.set_rest_alpha(pct / 100.0)
+
     # ── Save ─────────────────────────────────────────────────────────────────
 
     def _save(self):
@@ -1907,6 +2073,7 @@ class SettingsWindow:
         mic_device = "" if mic_choice == "System default" else mic_choice
         anthropic_api_key = self._anthropic_api_key_var.get().strip()
         anthropic_model = self._anthropic_model_var.get().strip() or ANTHROPIC_MODEL_DEFAULT
+        toolbar_alpha = clamp_toolbar_alpha(self._toolbar_alpha_pct_var.get() / 100.0)
 
         # Collect per-style hotkeys
         style_hotkeys = {}
@@ -1980,6 +2147,8 @@ class SettingsWindow:
         _sb = FloatingStatusBar.get()
         if _sb:
             _sb.sync_style()
+            _sb.set_rest_alpha(toolbar_alpha)
+        self._app._toolbar_alpha = toolbar_alpha
         self._app._anthropic_api_key = anthropic_api_key
         self._app._anthropic_model = anthropic_model
         self._app._refresh_menu()
@@ -2002,6 +2171,8 @@ class SettingsWindow:
             "mic_device": mic_device,
             "anthropic_api_key": anthropic_api_key,
             "anthropic_model": anthropic_model,
+            "toolbar_alpha": toolbar_alpha,
+            "toolbar_visible": self._app._toolbar_visible,
         })
 
         self._on_close()
@@ -2353,6 +2524,8 @@ class TinyReadAloud:
         self._rephrase_style = cfg["rephrase_style"]
         self._style_hotkeys = cfg.get("style_hotkeys", dict(DEFAULT_STYLE_HOTKEYS))
         self._recall_style_hotkey = cfg.get("recall_style_hotkey", RECALL_STYLE_HOTKEY)
+        self._toolbar_alpha = clamp_toolbar_alpha(cfg.get("toolbar_alpha", DEFAULT_TOOLBAR_ALPHA))
+        self._toolbar_visible = bool(cfg.get("toolbar_visible", DEFAULT_TOOLBAR_VISIBLE))
         self._last_rephrase_style = self._rephrase_style
         self._anthropic_api_key = cfg["anthropic_api_key"]
         self._anthropic_model = cfg["anthropic_model"]
@@ -2567,6 +2740,11 @@ class TinyReadAloud:
         items.append(pystray.MenuItem("Speed", pystray.Menu(*speed_items)))
 
         items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem(
+            "Show Floating Toolbar",
+            self._cmd_show_toolbar,
+            checked=lambda item: self._is_toolbar_visible(),
+        ))
         items.append(pystray.MenuItem("Settings", self._cmd_settings))
         items.append(pystray.MenuItem("Check for Updates", self._cmd_check_updates))
         if self._update_info and self._update_info.available:
@@ -3323,6 +3501,23 @@ class TinyReadAloud:
         self._set_status("Rephrased.")
         if self.icon:
             self.icon.notify("Rephrased. Ready to continue.", "Rephrase")
+
+    def _is_toolbar_visible(self) -> bool:
+        sb = FloatingStatusBar.get()
+        if sb is None:
+            return False
+        return sb.is_visible() and sb._root is not None
+
+    def _cmd_show_toolbar(self, icon, item):
+        sb = FloatingStatusBar.get()
+        if sb and sb.is_visible():
+            sb.hide_bar()
+        elif sb:
+            sb.show_bar()
+        else:
+            FloatingStatusBar.open(self)
+            self._status_bar = FloatingStatusBar.get()
+        self._refresh_menu()
 
     def _cmd_settings(self, icon, item):
         SettingsWindow.open(self)
