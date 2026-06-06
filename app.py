@@ -665,6 +665,41 @@ def capture_selected_text(target_hwnd=None):
     return ""
 
 
+def strip_markdown_for_speech(text: str) -> str:
+    """Remove common Markdown syntax so TTS reads natural speech."""
+    if not text:
+        return ""
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Fenced code blocks — keep inner text, drop fence lines
+    s = re.sub(r"```[^\n]*\n(.*?)```", r"\1", s, flags=re.DOTALL)
+    s = re.sub(r"```([^`]+)```", r"\1", s)
+
+    # ATX headers (# … ######)
+    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.MULTILINE)
+
+    # Images and links
+    s = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+
+    # Bold / italic / strike / inline code
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"__(.+?)__", r"\1", s)
+    s = re.sub(r"~~(.+?)~~", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", s)
+    s = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"\1", s)
+
+    # Blockquotes, list markers, horizontal rules
+    s = re.sub(r"^>\s?", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^[\t ]*[-*+]\s+", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^[\t ]*\d+\.\s+", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^[\*\-_]{3,}\s*$", "", s, flags=re.MULTILINE)
+
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def split_sentences(text):
     """Split text into sentence chunks for skip navigation."""
     text = (text or "").strip()
@@ -2045,6 +2080,7 @@ class TTSWorker:
                 pass
 
     def speak(self, text):
+        text = strip_markdown_for_speech(text)
         lang = detect_language(text)
         voice = self._voice_es if lang == "es" else self._voice_en
         kokoro_lang = _KOKORO_LANG.get(lang, "en-us")

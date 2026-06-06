@@ -63,6 +63,26 @@ class TestOcrReflow(unittest.TestCase):
         self.assertEqual(cap_mod._join_ocr_lines("resolu-", "tion"), "resolution")
 
 
+class TestMarkdownStrip(unittest.TestCase):
+    def test_bold_removed(self):
+        out = app_mod.strip_markdown_for_speech("This is **important** text.")
+        self.assertEqual(out, "This is important text.")
+
+    def test_headers_removed(self):
+        out = app_mod.strip_markdown_for_speech("# Title\n\n## Section\n\nBody.")
+        self.assertEqual(out, "Title\n\nSection\n\nBody.")
+
+    def test_mixed_markdown(self):
+        raw = "## Intro\n\nRead **this** and [a link](https://x.com)."
+        out = app_mod.strip_markdown_for_speech(raw)
+        self.assertIn("Intro", out)
+        self.assertNotIn("**", out)
+        self.assertNotIn("##", out)
+        self.assertIn("this", out)
+        self.assertIn("a link", out)
+        self.assertNotIn("https", out)
+
+
 class TestSplitSentences(unittest.TestCase):
     def test_basic_sentences(self):
         parts = app_mod.split_sentences("Hello world. How are you? Fine!")
