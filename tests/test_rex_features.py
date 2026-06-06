@@ -186,6 +186,36 @@ class TestDependencies(unittest.TestCase):
 
 
 class TestToolbarGeometry(unittest.TestCase):
+    def test_prepare_restore_keeps_width(self):
+        import tkinter as tk
+        from app import FloatingStatusBar
+
+        done = threading.Event()
+        ok = {"v": False, "w": 0}
+
+        def run():
+            root = tk.Tk()
+            root.withdraw()
+            bar = FloatingStatusBar.__new__(FloatingStatusBar)
+            bar._root = root
+            bar.W = FloatingStatusBar.W
+            bar.H = FloatingStatusBar.H
+            bar.MIN_W = FloatingStatusBar.MIN_W
+            root.geometry(f"{bar.W}x{bar.H}+100+100")
+            root.update_idletasks()
+            bar.prepare_for_ocr_overlay()
+            bar.restore_after_ocr_overlay()
+            geo = root.geometry()
+            w = int(geo.split("x")[0])
+            ok["w"] = w
+            ok["v"] = w >= bar.MIN_W
+            root.destroy()
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        self.assertTrue(done.wait(10))
+        self.assertTrue(ok["v"], f"toolbar width too small after restore: {ok['w']}")
+
     def test_prepare_restore_alpha(self):
         import tkinter as tk
         done = threading.Event()
