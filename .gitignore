@@ -4,7 +4,6 @@ venv/
 build/
 dist/
 installer_output/
-assets/app.ico
 *.onnx
 *.bin
 config.json

@@ -1,5 +1,7 @@
 # TinyReadAloud
 
+![TinyReadAloud — Select · OCR · Listen](assets/banner-readme.png)
+
 Select text, press a hotkey, hear it read aloud. A lightweight Windows system tray app powered by [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) text-to-speech — with built-in dictation, AI grammar checking, and rephrase styles.
 
 ## Features
@@ -38,7 +40,7 @@ Select text, press a hotkey, hear it read aloud. A lightweight Windows system tr
 - **Non-focus-stealing** — uses Win32 `WS_EX_NOACTIVATE` so it never takes keyboard focus from your editor
 
 ### System Tray
-- **Dynamic icon** — red when idle, green when speaking
+- **Dynamic icon** — Gemini dark speaker icon; green equalizer bars while speaking
 - **Right-click menu** — Stop Reading, Start/Stop Dictation, Check Grammar, Rephrase, voice submenus, speed, Settings, update options, Exit
 
 ### Updates
@@ -245,12 +247,16 @@ TinyReadAloud/
 ├── updater.py          GitHub Releases update checker & silent installer download
 ├── config.json         Default config (dev only; runtime config in %LOCALAPPDATA%)
 ├── requirements.txt    Python dependencies
-├── generate_icon.py    Creates assets/app.ico from the tray icon renderer
+├── generate_icon.py    Icons, shortcut.ico, and social banners → assets/
 ├── tinyreadaloud.spec  PyInstaller build spec (CPU + GPU variants)
 ├── installer.iss       Inno Setup installer script (startup option, silent upgrade)
 ├── build.bat           Build automation (PyInstaller → Inno Setup)
-└── assets/
-    └── app.ico         Application icon (multi-size ICO)
+├── scripts/
+│   └── create-shortcut.ps1   Desktop + Start Menu shortcuts (source install)
+└── assets/             Brand pack — see assets/README.md
+    ├── app.ico / shortcut.ico
+    ├── icon-16…512.png
+    └── banner-github / opengraph / readme.png
 ```
 
 ## License
