@@ -70,6 +70,7 @@ DEFAULT_TOOLBAR_VISIBLE = True
 TOOLBAR_ALPHA_MIN = 0.15
 TOOLBAR_ALPHA_HOVER = 1.0
 DEFAULT_STOP_READING_ON_KEYPRESS = False
+DEFAULT_OCR_COPY_ONLY = False
 PLAYBACK_KEY_DEBOUNCE_SEC = 1.0
 PLAYBACK_MODIFIER_KEYS = frozenset({
     "ctrl", "alt", "shift",
@@ -334,7 +335,8 @@ def load_config():
                 "anthropic_model": ANTHROPIC_MODEL_DEFAULT,
                 "toolbar_alpha": DEFAULT_TOOLBAR_ALPHA,
                 "toolbar_visible": DEFAULT_TOOLBAR_VISIBLE,
-                "stop_reading_on_keypress": DEFAULT_STOP_READING_ON_KEYPRESS}
+                "stop_reading_on_keypress": DEFAULT_STOP_READING_ON_KEYPRESS,
+                "ocr_copy_only": DEFAULT_OCR_COPY_ONLY}
     if not os.path.exists(CONFIG_PATH):
         return defaults
     try:
@@ -833,6 +835,8 @@ class FloatingStatusBar:
     PILL_READ_H = "#2563A8"
     PILL_OCR   = "#2D2640"
     PILL_OCR_H = "#4A3D6E"
+    PILL_CLIP  = "#1A3D34"
+    PILL_CLIP_H = "#2A6B5A"
     CHIP_BG    = "#303134"
     CHIP_HOVER = "#3C4043"
     W, H       = 660, 42
@@ -937,6 +941,24 @@ class FloatingStatusBar:
                 self._root.after(0, self._refresh_playback_ui)
             except Exception:
                 pass
+
+    def sync_ocr_mode(self):
+        """Refresh OCR/Clip pill label and colors from app mode."""
+        if not self._root or self._btn_ocr is None:
+            return
+        copy_only = getattr(self._app, "_ocr_copy_only", False)
+
+        def _apply():
+            label = "Clip" if copy_only else "OCR"
+            bg = self.PILL_CLIP if copy_only else self.PILL_OCR
+            self._btn_ocr.config(text=label, bg=bg, fg=self.ACCENT2 if not copy_only else self.FG)
+            if self._pill_ocr:
+                self._pill_ocr.config(bg=bg)
+
+        try:
+            self._root.after(0, _apply)
+        except Exception:
+            pass
 
     def _parse_geometry_pos(self, geo: str) -> str:
         """Return +x+y from a Tk geometry string; default centered top."""
@@ -1137,7 +1159,14 @@ class FloatingStatusBar:
             borderwidth=0,
         )
         menu.add_command(label="Read", command=self._tb_read)
-        menu.add_command(label="Read Region (OCR)…", command=self._tb_ocr)
+        ocr_action = "Copy Region (OCR)…" if self._app._ocr_copy_only else "Read Region (OCR)…"
+        menu.add_command(label=ocr_action, command=self._tb_ocr)
+        self._ocr_menu_copy_var = tk.BooleanVar(value=self._app._ocr_copy_only)
+        menu.add_checkbutton(
+            label="OCR → clipboard only",
+            variable=self._ocr_menu_copy_var,
+            command=self._on_ocr_copy_only_menu,
+        )
         menu.add_separator()
         menu.add_command(label="Pause", command=self._tb_pause)
         menu.add_command(label="Resume", command=self._tb_resume)
@@ -1176,9 +1205,17 @@ class FloatingStatusBar:
             self._speed_display_var.set(label)
         self._app.set_reading_speed(speed)
 
+    def _on_ocr_copy_only_menu(self):
+        self._app.set_ocr_copy_only(bool(self._ocr_menu_copy_var.get()), persist=True)
+
     def _show_context_menu(self, event):
         if self._context_menu is None:
             self._build_context_menu()
+        else:
+            try:
+                self._ocr_menu_copy_var.set(self._app._ocr_copy_only)
+            except Exception:
+                pass
         try:
             self._context_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1571,6 +1608,7 @@ class FloatingStatusBar:
             self._bind_context_menu(w)
 
         self._refresh_playback_ui()
+        self.sync_ocr_mode()
         if not self._visible:
             root.withdraw()
         root.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -1823,6 +1861,17 @@ class SettingsWindow:
             self._add_clear_btn(sec, var, r)
             r += 1
 
+        self._ocr_copy_only_var = tk.BooleanVar(value=self._app._ocr_copy_only)
+        tk.Checkbutton(
+            sec,
+            text="OCR copies to clipboard only (do not read aloud)",
+            variable=self._ocr_copy_only_var,
+            bg=self.BG2, fg=self.FG, selectcolor=self.ENTRY_BG,
+            activebackground=self.BG2, activeforeground=self.FG,
+            font=("Segoe UI", 9), anchor="w",
+            command=self._on_ocr_copy_only_settings,
+        ).grid(row=r, column=0, columnspan=4, sticky="w", padx=10, pady=(2, 6))
+
         # ── Grammar & Dictation ──
         sec = self._make_section(left_col, "Grammar & Dictation")
         r = 0
@@ -2065,6 +2114,9 @@ class SettingsWindow:
         if sb:
             sb.set_rest_alpha(pct / 100.0)
 
+    def _on_ocr_copy_only_settings(self):
+        self._app.set_ocr_copy_only(bool(self._ocr_copy_only_var.get()), persist=False)
+
     # ── Save ─────────────────────────────────────────────────────────────────
 
     def _save(self):
@@ -2094,6 +2146,7 @@ class SettingsWindow:
         anthropic_model = self._anthropic_model_var.get().strip() or ANTHROPIC_MODEL_DEFAULT
         toolbar_alpha = clamp_toolbar_alpha(self._toolbar_alpha_pct_var.get() / 100.0)
         stop_reading_on_keypress = bool(self._stop_on_key_var.get())
+        ocr_copy_only = bool(self._ocr_copy_only_var.get())
 
         # Collect per-style hotkeys
         style_hotkeys = {}
@@ -2170,6 +2223,7 @@ class SettingsWindow:
             _sb.set_rest_alpha(toolbar_alpha)
         self._app._toolbar_alpha = toolbar_alpha
         self._app._stop_reading_on_keypress = stop_reading_on_keypress
+        self._app.set_ocr_copy_only(ocr_copy_only, persist=False)
         self._app._anthropic_api_key = anthropic_api_key
         self._app._anthropic_model = anthropic_model
         self._app._refresh_menu()
@@ -2195,6 +2249,7 @@ class SettingsWindow:
             "toolbar_alpha": toolbar_alpha,
             "toolbar_visible": self._app._toolbar_visible,
             "stop_reading_on_keypress": stop_reading_on_keypress,
+            "ocr_copy_only": ocr_copy_only,
         })
 
         self._on_close()
@@ -2614,6 +2669,7 @@ class TinyReadAloud:
         self._stop_reading_on_keypress = bool(
             cfg.get("stop_reading_on_keypress", DEFAULT_STOP_READING_ON_KEYPRESS)
         )
+        self._ocr_copy_only = bool(cfg.get("ocr_copy_only", DEFAULT_OCR_COPY_ONLY))
         self._last_rephrase_style = self._rephrase_style
         self._anthropic_api_key = cfg["anthropic_api_key"]
         self._anthropic_model = cfg["anthropic_model"]
@@ -2747,6 +2803,11 @@ class TinyReadAloud:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Read Region (OCR)…", self._cmd_ocr_region),
+            pystray.MenuItem(
+                "OCR → clipboard only",
+                self._cmd_toggle_ocr_copy_only,
+                checked=lambda item: self._ocr_copy_only,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Next Sentence",
@@ -2883,11 +2944,29 @@ class TinyReadAloud:
                 target_hwnd = self._status_bar._last_target_hwnd
         self.start_read(target_hwnd)
 
+    def set_ocr_copy_only(self, enabled, persist=True):
+        """When True, OCR region puts text on clipboard instead of reading aloud."""
+        self._ocr_copy_only = bool(enabled)
+        sb = FloatingStatusBar.get()
+        if sb:
+            sb.sync_ocr_mode()
+        if persist:
+            try:
+                cfg = load_config()
+                cfg["ocr_copy_only"] = self._ocr_copy_only
+                save_config(cfg)
+            except Exception:
+                pass
+        self._refresh_menu()
+
+    def _cmd_toggle_ocr_copy_only(self, icon, item):
+        self.set_ocr_copy_only(not self._ocr_copy_only)
+
     def _on_ocr_hotkey(self):
         self.start_ocr_read()
 
     def start_ocr_read(self):
-        """Dim screen and let the user drag a region to OCR and read."""
+        """Dim screen and let the user drag a region to OCR (read or copy)."""
         if self._ocr_in_progress:
             self._set_status("OCR already in progress…")
             return
@@ -2897,7 +2976,7 @@ class TinyReadAloud:
             if self.icon:
                 self.icon.notify(msg, "TinyReadAloud — OCR")
             return
-        if self.tts.is_active:
+        if self.tts.is_active and not self._ocr_copy_only:
             self.tts.stop()
         self._ocr_in_progress = True
         parent = None
@@ -2936,6 +3015,24 @@ class TinyReadAloud:
                 self._set_status("No text in region.")
                 if self.icon:
                     self.icon.notify(self._ocr_user_message(result), "TinyReadAloud")
+                return
+            if self._ocr_copy_only:
+                if clipboard_set_text(result.text):
+                    n = len(result.text)
+                    self._set_status(f"Copied {n} chars.")
+                    log_event("OCR", "copied to clipboard", trace_id=trace_id, chars=n)
+                    if self.icon:
+                        self.icon.notify(
+                            f"OCR copied {n} characters to clipboard.",
+                            "TinyReadAloud",
+                        )
+                else:
+                    self._set_status("Clipboard copy failed.")
+                    if self.icon:
+                        self.icon.notify(
+                            "OCR succeeded but clipboard copy failed. Try again.",
+                            "TinyReadAloud",
+                        )
                 return
             self._set_status("Read (OCR)…")
             self._reset_hotkeys()
