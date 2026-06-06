@@ -758,16 +758,28 @@ _STATUSBAR_TRANSPARENT = "#010203"
 class FloatingStatusBar:
     """Tiny draggable always-on-top bar: style switcher + live status + settings gear."""
 
-    BG     = "#1a1a2e"
-    FG     = "#e2e8f0"
-    DIM    = "#8892a0"
-    ACCENT = "#a78bfa"
-    SEP    = "#2d3748"
-    W, H   = 640, 36
-    RADIUS = 10
-    MIN_W  = 620
-    _FONT  = ("Segoe UI", 9)
-    _FONTB = ("Segoe UI", 9, "bold")
+    # Google Gemini dark theme (blue → purple aurora accent)
+    BG         = "#1E1F20"
+    BG_ELEV    = "#28292A"
+    FG         = "#E8EAED"
+    DIM        = "#9AA0A6"
+    ACCENT     = "#4796E3"   # Gemini blue
+    ACCENT2    = "#9177C7"   # Gemini purple
+    GEM_ROSE   = "#CA6673"
+    SEP        = "#3C4043"
+    BORDER     = "#5F6368"
+    PILL_READ  = "#1A3A5C"
+    PILL_READ_H = "#2563A8"
+    PILL_OCR   = "#2D2640"
+    PILL_OCR_H = "#4A3D6E"
+    CHIP_BG    = "#303134"
+    CHIP_HOVER = "#3C4043"
+    W, H       = 660, 42
+    RADIUS     = 14
+    MIN_W      = 640
+    _FONT      = ("Segoe UI", 9)
+    _FONTB     = ("Segoe UI Semibold", 9, "bold")
+    _FONT_ICON = ("Segoe UI Symbol", 10)
 
     _instance_lock = threading.Lock()
     _instance = None
@@ -807,6 +819,8 @@ class FloatingStatusBar:
         self._speed_display_var = None
         self._btn_spd_down = self._btn_spd_up = None
         self._btn_ocr = None
+        self._pill_read = self._pill_ocr = None
+        self._canvas = None
         self._context_menu = None
         try:
             self._style_idx = REPHRASE_STYLES.index(app._rephrase_style)
@@ -894,9 +908,12 @@ class FloatingStatusBar:
         paused = tts.is_paused
         self._btn_read.config(
             state="normal",
-            fg=self.ACCENT,
-            text="Stop" if active else "Read",
+            fg=self.FG,
+            text="Stop" if active else "✦ Read",
         )
+        if self._pill_read:
+            self._pill_read.config(bg=self.PILL_READ_H if active else self.PILL_READ)
+            self._btn_read.config(bg=self.PILL_READ_H if active else self.PILL_READ)
         for btn, enabled in (
             (self._btn_pause, active and not paused),
             (self._btn_resume, paused),
@@ -951,7 +968,7 @@ class FloatingStatusBar:
         menu = tk.Menu(
             self._root, tearoff=0,
             bg=self.BG, fg=self.FG,
-            activebackground=self.ACCENT, activeforeground="#1a1a2e",
+            activebackground=self.ACCENT, activeforeground=self.BG,
             borderwidth=0,
         )
         menu.add_command(label="Read", command=self._tb_read)
@@ -970,7 +987,7 @@ class FloatingStatusBar:
         speed_menu = tk.Menu(
             menu, tearoff=0,
             bg=self.BG, fg=self.FG,
-            activebackground=self.ACCENT, activeforeground="#1a1a2e",
+            activebackground=self.ACCENT, activeforeground=self.BG,
             borderwidth=0,
         )
         for preset in SPEED_PRESETS:
@@ -1004,13 +1021,66 @@ class FloatingStatusBar:
     def _bind_context_menu(self, widget):
         widget.bind("<Button-3>", self._show_context_menu, add="+")
 
-    def _bind_btn(self, btn, command, hover=True):
+    def _bind_btn(self, btn, command, hover=True, default_fg=None, default_bg=None,
+                  hover_fg=None, hover_bg=None):
+        default_fg = default_fg if default_fg is not None else btn.cget("fg")
+        default_bg = default_bg if default_bg is not None else btn.cget("bg")
+        hover_fg = hover_fg if hover_fg is not None else self.ACCENT
+        hover_bg = hover_bg if hover_bg is not None else default_bg
         btn.bind("<Button-1>", command)
         if hover:
-            btn.bind("<Enter>", lambda e: btn.config(
-                fg=self.ACCENT if btn.cget("state") == "normal" else self.DIM))
-            btn.bind("<Leave>", lambda e: btn.config(
-                fg=self.ACCENT if btn.cget("state") == "normal" else self.DIM))
+            def _on_enter(_e):
+                if btn.cget("state") == "normal":
+                    btn.config(fg=hover_fg, bg=hover_bg)
+            def _on_leave(_e):
+                if btn.cget("state") == "normal":
+                    btn.config(fg=default_fg, bg=default_bg)
+                else:
+                    btn.config(fg=self.DIM, bg=default_bg)
+            btn.bind("<Enter>", _on_enter)
+            btn.bind("<Leave>", _on_leave)
+
+    def _bind_pill(self, wrap, lbl, command, default_bg, hover_bg,
+                   default_fg=None, hover_fg=None):
+        default_fg = default_fg or lbl.cget("fg")
+        hover_fg = hover_fg or self.FG
+        for w in (wrap, lbl):
+            w.bind("<Button-1>", command)
+            w.bind("<Enter>", lambda _e: (
+                wrap.config(bg=hover_bg), lbl.config(bg=hover_bg, fg=hover_fg)
+            ))
+            w.bind("<Leave>", lambda _e: (
+                wrap.config(bg=default_bg), lbl.config(bg=default_bg, fg=default_fg)
+            ))
+
+    @staticmethod
+    def _lerp_hex(c1: str, c2: str, t: float) -> str:
+        def _rgb(h):
+            h = h.lstrip("#")
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        r1, g1, b1 = _rgb(c1)
+        r2, g2, b2 = _rgb(c2)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_gemini_shell(self, canvas, w, h, r):
+        """Dark surface + subtle border + blue→purple aurora strip."""
+        canvas.delete("shell")
+        self._rounded_rect(
+            canvas, 0, 0, w, h, r,
+            fill=self.BG, outline=self.BORDER, width=1, tags="shell",
+        )
+        x0, x1 = r, max(r + 1, w - r)
+        span = max(x1 - x0, 1)
+        for i in range(span):
+            t = i / max(span - 1, 1)
+            if t <= 0.55:
+                color = self._lerp_hex(self.ACCENT, self.ACCENT2, t / 0.55)
+            else:
+                color = self._lerp_hex(self.ACCENT2, self.GEM_ROSE, (t - 0.55) / 0.45)
+            canvas.create_line(x0 + i, 2, x0 + i, 5, fill=color, tags="shell")
 
     def _place_btn(self, canvas, btn, x, ymid):
         canvas.create_window(x, ymid, window=btn, anchor="w")
@@ -1151,22 +1221,23 @@ class FloatingStatusBar:
                 time.sleep(0.15)
         threading.Thread(target=_fg_tracker, daemon=True).start()
 
-        # ── Canvas background + Frame toolbar (overlay, no absolute coords) ──
+        # ── Canvas background + Frame toolbar (Gemini dark shell) ──
         canvas = tk.Canvas(root, width=W, height=H, bg=T, highlightthickness=0)
         canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        self._rounded_rect(canvas, 0, 0, W, H, R, fill=self.BG, outline=self.BG)
+        self._canvas = canvas
+        self._draw_gemini_shell(canvas, W, H, R)
 
         bar = tk.Frame(root, bg=self.BG, bd=0, highlightthickness=0)
         bar.place(x=0, y=0, relwidth=1, relheight=1)
 
         def _sep(parent):
-            tk.Frame(parent, bg=self.SEP, width=1, height=H - 12).pack(
-                side=tk.LEFT, padx=3, pady=6,
+            tk.Frame(parent, bg=self.SEP, width=1, height=H - 18).pack(
+                side=tk.LEFT, padx=4, pady=9,
             )
 
-        def _lbl(text="", textvariable=None, font=None, fg=None,
+        def _lbl(text="", textvariable=None, font=None, fg=None, bg=None,
                  width=None, anchor="center", cursor="arrow", parent=bar):
-            kw = dict(bg=self.BG, fg=fg or self.FG,
+            kw = dict(bg=bg or self.BG, fg=fg or self.FG,
                       font=font or self._FONT, cursor=cursor, bd=0)
             if textvariable is not None:
                 kw["textvariable"] = textvariable
@@ -1178,88 +1249,116 @@ class FloatingStatusBar:
                 kw["anchor"] = anchor
             return tk.Label(parent, **kw)
 
+        def _pill(parent, text, pill_bg, pill_hover, fg, cmd, bold=False, padx=10):
+            wrap = tk.Frame(parent, bg=pill_bg, bd=0, highlightthickness=0)
+            lbl = tk.Label(
+                wrap, text=text, bg=pill_bg, fg=fg,
+                font=self._FONTB if bold else self._FONT,
+                cursor="hand2", bd=0, padx=padx, pady=4,
+            )
+            lbl.pack()
+            self._bind_pill(wrap, lbl, cmd, pill_bg, pill_hover, default_fg=fg)
+            wrap.pack(side=tk.LEFT, padx=(0, 4))
+            return wrap, lbl
+
         left = tk.Frame(bar, bg=self.BG, bd=0)
-        left.pack(side=tk.LEFT, padx=(6, 0), pady=2)
+        left.pack(side=tk.LEFT, padx=(10, 0), pady=5)
 
-        self._btn_read = _lbl("Read", fg=self.ACCENT, cursor="hand2", width=4,
-                              font=self._FONTB, parent=left)
-        self._bind_btn(self._btn_read, self._tb_read)
-        self._btn_read.pack(side=tk.LEFT, padx=(2, 0))
+        self._pill_read, self._btn_read = _pill(
+            left, "✦ Read", self.PILL_READ, self.PILL_READ_H, self.FG, self._tb_read, bold=True,
+        )
         _sep(left)
 
-        for sym, cmd, w in (
-            ("⏸", self._tb_pause, 2),
-            ("▶", self._tb_resume, 2),
-            ("⏹", self._tb_stop, 2),
+        for sym, cmd, w, attr in (
+            ("⏸", self._tb_pause, 2, "_btn_pause"),
+            ("▶", self._tb_resume, 2, "_btn_resume"),
+            ("⏹", self._tb_stop, 2, "_btn_stop"),
         ):
-            btn = _lbl(sym, fg=self.DIM, cursor="hand2", width=w, parent=left)
-            self._bind_btn(btn, cmd)
-            btn.pack(side=tk.LEFT)
-            setattr(self, f"_btn_{'pause' if sym == '⏸' else 'resume' if sym == '▶' else 'stop'}", btn)
+            btn = _lbl(sym, fg=self.DIM, font=self._FONT_ICON, cursor="hand2",
+                       width=w, parent=left)
+            self._bind_btn(btn, cmd, default_fg=self.DIM, hover_fg=self.ACCENT)
+            btn.pack(side=tk.LEFT, padx=1)
+            setattr(self, attr, btn)
         _sep(left)
 
-        self._btn_prev = _lbl("⏮", fg=self.DIM, cursor="hand2", width=2, parent=left)
-        self._bind_btn(self._btn_prev, self._tb_prev_sentence)
-        self._btn_prev.pack(side=tk.LEFT)
-        self._btn_next = _lbl("⏭", fg=self.DIM, cursor="hand2", width=2, parent=left)
-        self._bind_btn(self._btn_next, self._tb_next_sentence)
-        self._btn_next.pack(side=tk.LEFT)
+        self._btn_prev = _lbl("⏮", fg=self.DIM, font=self._FONT_ICON, cursor="hand2",
+                              width=2, parent=left)
+        self._bind_btn(self._btn_prev, self._tb_prev_sentence,
+                       default_fg=self.DIM, hover_fg=self.ACCENT)
+        self._btn_prev.pack(side=tk.LEFT, padx=1)
+        self._btn_next = _lbl("⏭", fg=self.DIM, font=self._FONT_ICON, cursor="hand2",
+                              width=2, parent=left)
+        self._bind_btn(self._btn_next, self._tb_next_sentence,
+                       default_fg=self.DIM, hover_fg=self.ACCENT)
+        self._btn_next.pack(side=tk.LEFT, padx=1)
         _sep(left)
 
-        self._btn_back = _lbl(f"-{SKIP_SECONDS}s", fg=self.DIM, cursor="hand2", width=4, parent=left)
-        self._bind_btn(self._btn_back, self._tb_skip_back)
-        self._btn_back.pack(side=tk.LEFT)
-        self._btn_fwd = _lbl(f"+{SKIP_SECONDS}s", fg=self.DIM, cursor="hand2", width=4, parent=left)
-        self._bind_btn(self._btn_fwd, self._tb_skip_forward)
-        self._btn_fwd.pack(side=tk.LEFT, padx=(0, 2))
+        self._btn_back = _lbl(f"−{SKIP_SECONDS}s", fg=self.DIM, cursor="hand2",
+                              width=4, parent=left)
+        self._bind_btn(self._btn_back, self._tb_skip_back,
+                       default_fg=self.DIM, hover_fg=self.ACCENT2)
+        self._btn_back.pack(side=tk.LEFT, padx=1)
+        self._btn_fwd = _lbl(f"+{SKIP_SECONDS}s", fg=self.DIM, cursor="hand2",
+                             width=4, parent=left)
+        self._bind_btn(self._btn_fwd, self._tb_skip_forward,
+                       default_fg=self.DIM, hover_fg=self.ACCENT2)
+        self._btn_fwd.pack(side=tk.LEFT, padx=(1, 2))
         _sep(left)
 
-        self._btn_ocr = _lbl("OCR", fg=self.ACCENT, cursor="hand2", width=3,
-                              font=self._FONTB, parent=left)
-        self._bind_btn(self._btn_ocr, self._tb_ocr)
-        self._btn_ocr.pack(side=tk.LEFT, padx=(0, 2))
+        self._pill_ocr, self._btn_ocr = _pill(
+            left, "OCR", self.PILL_OCR, self.PILL_OCR_H, self.ACCENT2,
+            self._tb_ocr, bold=True, padx=8,
+        )
 
         # Status — flexible center
         self._status_var = tk.StringVar(value="Ready")
         lbl_status = _lbl(textvariable=self._status_var, fg=self.DIM, width=14,
                           anchor="w", parent=bar)
-        lbl_status.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4))
+        lbl_status.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 4))
 
-        # Right cluster: speed + style + gear
+        # Right cluster: speed chip + style + gear
         right = tk.Frame(bar, bg=self.BG, bd=0)
-        right.pack(side=tk.RIGHT, padx=(0, 6), pady=2)
+        right.pack(side=tk.RIGHT, padx=(0, 10), pady=5)
 
         btn_gear = _lbl("⚙", font=("Segoe UI", 11), fg=self.DIM, cursor="hand2", parent=right)
-        self._bind_btn(btn_gear, self._open_settings)
-        btn_gear.pack(side=tk.RIGHT, padx=(4, 0))
+        self._bind_btn(btn_gear, self._open_settings, default_fg=self.DIM, hover_fg=self.ACCENT)
+        btn_gear.pack(side=tk.RIGHT, padx=(6, 0))
 
         self._style_var = tk.StringVar(value=REPHRASE_STYLES[self._style_idx])
-        lbl_style = _lbl(textvariable=self._style_var, font=self._FONTB, fg=self.DIM,
+        lbl_style = _lbl(textvariable=self._style_var, font=self._FONTB, fg=self.ACCENT2,
                          width=8, anchor="e", cursor="hand2", parent=right)
         lbl_style.bind("<Button-1>", self._trigger_rephrase)
-        lbl_style.bind("<Enter>", lambda e: lbl_style.config(fg=self.ACCENT))
-        lbl_style.bind("<Leave>", lambda e: lbl_style.config(fg=self.DIM))
-        lbl_style.pack(side=tk.RIGHT, padx=(4, 6))
+        lbl_style.bind("<Enter>", lambda e: lbl_style.config(fg=self.FG))
+        lbl_style.bind("<Leave>", lambda e: lbl_style.config(fg=self.ACCENT2))
+        lbl_style.pack(side=tk.RIGHT, padx=(4, 8))
 
         _sep(right)
 
-        speed_box = tk.Frame(right, bg=self.BG, bd=0)
+        speed_box = tk.Frame(right, bg=self.CHIP_BG, bd=0, highlightthickness=0)
         speed_box.pack(side=tk.RIGHT, padx=(0, 2))
+        speed_inner = tk.Frame(speed_box, bg=self.CHIP_BG, bd=0)
+        speed_inner.pack(padx=4, pady=2)
         self._speed_display_var = tk.StringVar(
             value=format_speed(self._app.tts.current_speed)
         )
-        self._btn_spd_up = _lbl("+", fg=self.DIM, cursor="hand2", width=2, parent=speed_box)
-        self._bind_btn(self._btn_spd_up, lambda e: self._step_speed(1))
+        self._btn_spd_up = _lbl("+", fg=self.DIM, cursor="hand2", width=2,
+                                bg=self.CHIP_BG, parent=speed_inner)
+        self._bind_btn(self._btn_spd_up, lambda e: self._step_speed(1),
+                        default_fg=self.DIM, default_bg=self.CHIP_BG,
+                        hover_fg=self.FG, hover_bg=self.CHIP_HOVER)
         self._btn_spd_up.pack(side=tk.RIGHT)
         lbl_speed = _lbl(textvariable=self._speed_display_var, width=3,
-                         anchor="center", parent=speed_box)
-        lbl_speed.pack(side=tk.RIGHT)
-        self._btn_spd_down = _lbl("−", fg=self.DIM, cursor="hand2", width=2, parent=speed_box)
-        self._bind_btn(self._btn_spd_down, lambda e: self._step_speed(-1))
+                         anchor="center", fg=self.FG, bg=self.CHIP_BG, parent=speed_inner)
+        lbl_speed.pack(side=tk.RIGHT, padx=2)
+        self._btn_spd_down = _lbl("−", fg=self.DIM, cursor="hand2", width=2,
+                                   bg=self.CHIP_BG, parent=speed_inner)
+        self._bind_btn(self._btn_spd_down, lambda e: self._step_speed(-1),
+                        default_fg=self.DIM, default_bg=self.CHIP_BG,
+                        hover_fg=self.FG, hover_bg=self.CHIP_HOVER)
         self._btn_spd_down.pack(side=tk.RIGHT)
 
-        for w in (bar, left, right, speed_box, lbl_status, lbl_style, btn_gear,
-                  lbl_speed, self._btn_read, self._btn_ocr):
+        for w in (bar, left, right, speed_box, speed_inner, lbl_status, lbl_style, btn_gear,
+                  lbl_speed, self._btn_read, self._btn_ocr, self._pill_read, self._pill_ocr):
             try:
                 w.configure(takefocus=0)
             except Exception:
@@ -1273,7 +1372,7 @@ class FloatingStatusBar:
             pos = f"+{(sw - W) // 2}+48"
             root.geometry(f"{W}x{H}{pos}")
             canvas.config(width=W, height=H)
-            self._rounded_rect(canvas, 0, 0, W, H, R, fill=self.BG, outline=self.BG)
+            self._draw_gemini_shell(canvas, W, H, R)
 
         root.attributes("-topmost", True)
 
@@ -1288,6 +1387,7 @@ class FloatingStatusBar:
             self._btn_read, self._btn_pause, self._btn_resume, self._btn_stop,
             self._btn_prev, self._btn_next, self._btn_back, self._btn_fwd,
             self._btn_ocr, self._btn_spd_down, self._btn_spd_up, lbl_speed,
+            self._pill_read, self._pill_ocr, speed_box, speed_inner,
         )
         for w in drag_widgets:
             self._bind_context_menu(w)
