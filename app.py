@@ -16,10 +16,8 @@ from tkinter import messagebox, ttk
 import urllib.error
 import urllib.request
 
-from capture_fallbacks import (
-    capture_via_accessibility,
-    capture_via_ocr,
-)
+from capture_fallbacks import capture_via_accessibility, capture_ocr_region
+from ocr_region import RegionSelectOverlay
 from version import __version__
 
 # When frozen as a windowless app (console=False), stdout/stderr are None.
@@ -59,6 +57,7 @@ HOTKEY = "ctrl+alt+r"
 DICTATION_HOTKEY = "ctrl+alt+d"
 GRAMMAR_HOTKEY = "ctrl+alt+g"
 REPHRASE_HOTKEY = "ctrl+alt+p"
+OCR_HOTKEY = "ctrl+alt+o"
 DEFAULT_VOICE_EN = "af_heart"
 DEFAULT_VOICE_ES = "ef_dora"
 DEFAULT_SPEED = 1.0
@@ -265,9 +264,37 @@ def ensure_models():
     return True
 
 
-SPEED_OPTIONS = [("Slow", 0.8), ("Normal", 1.0), ("Fast", 1.2), ("Very Fast", 1.5)]
-SPEED_BY_LABEL = {label: spd for label, spd in SPEED_OPTIONS}
-SPEED_BY_VALUE = {spd: label for label, spd in SPEED_OPTIONS}
+SPEED_PRESETS = (0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0)
+SPEED_MIN, SPEED_MAX = 0.5, 3.0
+
+
+def format_speed(value: float) -> str:
+    return f"{float(value):.1f}"
+
+
+def parse_speed(text) -> float:
+    try:
+        cleaned = str(text).strip().lower().replace("×", "").replace("x", "")
+        val = float(cleaned)
+    except (TypeError, ValueError):
+        return DEFAULT_SPEED
+    return max(SPEED_MIN, min(SPEED_MAX, round(val, 2)))
+
+
+def clamp_speed(value) -> float:
+    return max(SPEED_MIN, min(SPEED_MAX, round(float(value), 2)))
+
+
+def preset_index(value: float) -> int:
+    v = clamp_speed(value)
+    best_i = 0
+    best_d = abs(SPEED_PRESETS[0] - v)
+    for i, preset in enumerate(SPEED_PRESETS):
+        dist = abs(preset - v)
+        if dist < best_d:
+            best_d = dist
+            best_i = i
+    return best_i
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -276,6 +303,7 @@ def load_config():
     """Load settings from config.json, returning defaults for missing keys."""
     defaults = {"hotkey": HOTKEY, "voice_en": DEFAULT_VOICE_EN,
                 "voice_es": DEFAULT_VOICE_ES, "speed": DEFAULT_SPEED,
+                "ocr_hotkey": OCR_HOTKEY,
                 "dictation_hotkey": DICTATION_HOTKEY,
                 "grammar_hotkey": GRAMMAR_HOTKEY,
                 "rephrase_hotkey": REPHRASE_HOTKEY,
@@ -782,8 +810,9 @@ class FloatingStatusBar:
         self._last_target_hwnd = 0  # last foreground HWND that isn't the status bar
         self._btn_read = self._btn_pause = self._btn_resume = self._btn_stop = None
         self._btn_prev = self._btn_next = self._btn_back = self._btn_fwd = None
-        self._speed_var = None
-        self._speed_combo = None
+        self._speed_display_var = None
+        self._btn_spd_down = self._btn_spd_up = None
+        self._btn_ocr = None
         self._context_menu = None
         try:
             self._style_idx = REPHRASE_STYLES.index(app._rephrase_style)
@@ -813,12 +842,12 @@ class FloatingStatusBar:
                 pass
 
     def sync_speed(self, speed=None):
-        """Keep toolbar speed dropdown in sync with TTS speed."""
+        """Keep toolbar speed display in sync with TTS speed."""
         speed = speed if speed is not None else self._app.tts.current_speed
-        label = SPEED_BY_VALUE.get(speed, "Normal")
-        if self._root and self._speed_var:
+        label = format_speed(speed)
+        if self._root and self._speed_display_var:
             try:
-                self._root.after(0, lambda l=label: self._speed_var.set(l))
+                self._root.after(0, lambda l=label: self._speed_display_var.set(l))
             except Exception:
                 pass
 
@@ -883,10 +912,13 @@ class FloatingStatusBar:
     def _tb_skip_forward(self, _=None):
         self._app.tts.skip_seconds(SKIP_SECONDS)
 
-    def _on_speed_selected(self, _=None):
-        label = self._speed_var.get() if self._speed_var else "Normal"
-        speed = SPEED_BY_LABEL.get(label, DEFAULT_SPEED)
-        self._app.set_reading_speed(speed)
+    def _tb_ocr(self, _=None):
+        self._app.start_ocr_read()
+
+    def _step_speed(self, delta, _=None):
+        idx = preset_index(self._app.tts.current_speed)
+        idx = max(0, min(len(SPEED_PRESETS) - 1, idx + delta))
+        self._app.set_reading_speed(SPEED_PRESETS[idx])
 
     def _build_context_menu(self):
         menu = tk.Menu(
@@ -896,6 +928,7 @@ class FloatingStatusBar:
             borderwidth=0,
         )
         menu.add_command(label="Read", command=self._tb_read)
+        menu.add_command(label="Read Region (OCR)…", command=self._tb_ocr)
         menu.add_separator()
         menu.add_command(label="Pause", command=self._tb_pause)
         menu.add_command(label="Resume", command=self._tb_resume)
@@ -913,10 +946,11 @@ class FloatingStatusBar:
             activebackground=self.ACCENT, activeforeground="#1a1a2e",
             borderwidth=0,
         )
-        for label, spd in SPEED_OPTIONS:
+        for preset in SPEED_PRESETS:
+            label = format_speed(preset)
             speed_menu.add_command(
                 label=label,
-                command=lambda s=spd, l=label: self._set_speed_from_menu(s, l),
+                command=lambda s=preset, l=label: self._set_speed_from_menu(s, l),
             )
         menu.add_cascade(label="Speed", menu=speed_menu)
         menu.add_separator()
@@ -925,8 +959,8 @@ class FloatingStatusBar:
         return menu
 
     def _set_speed_from_menu(self, speed, label):
-        if self._speed_var:
-            self._speed_var.set(label)
+        if self._speed_display_var:
+            self._speed_display_var.set(label)
         self._app.set_reading_speed(speed)
 
     def _show_context_menu(self, event):
@@ -1164,37 +1198,10 @@ class FloatingStatusBar:
         canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
         x += 6
 
-        # ── speed dropdown ───────────────────────────────────────────────────
-        speed_labels = [label for label, _ in SPEED_OPTIONS]
-        current_label = SPEED_BY_VALUE.get(self._app.tts.current_speed, "Normal")
-        self._speed_var = tk.StringVar(value=current_label)
-        style = ttk.Style(root)
-        style.theme_use("clam")
-        style.configure(
-            "Bar.TCombobox",
-            fieldbackground="#282840",
-            background=self.BG,
-            foreground=self.FG,
-            arrowcolor=self.DIM,
-            bordercolor=self.SEP,
-            lightcolor=self.BG,
-            darkcolor=self.BG,
-        )
-        self._speed_combo = ttk.Combobox(
-            root,
-            textvariable=self._speed_var,
-            values=speed_labels,
-            state="readonly",
-            width=9,
-            style="Bar.TCombobox",
-        )
-        self._speed_combo.bind("<<ComboboxSelected>>", self._on_speed_selected)
-        canvas.create_window(x, ymid, window=self._speed_combo, anchor="w")
-        try:
-            self._speed_combo.configure(takefocus=0)
-        except Exception:
-            pass
-        x += 78
+        self._btn_ocr = _lbl("OCR", fg=self.ACCENT, cursor="hand2", width=3, font=self._FONTB)
+        self._bind_btn(self._btn_ocr, self._tb_ocr)
+        self._place_btn(canvas, self._btn_ocr, x, ymid)
+        x += 34
 
         canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
         x += 6
@@ -1202,8 +1209,26 @@ class FloatingStatusBar:
         # ── status label ─────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="Ready")
         lbl_status = _lbl(textvariable=self._status_var,
-                          fg=self.DIM, width=10, anchor="w")
+                          fg=self.DIM, width=8, anchor="w")
         self._place_btn(canvas, lbl_status, x, ymid)
+
+        # ── speed stepper (right side, away from Read) ───────────────────────
+        self._speed_display_var = tk.StringVar(
+            value=format_speed(self._app.tts.current_speed)
+        )
+        self._btn_spd_down = _lbl("−", fg=self.DIM, cursor="hand2", width=2)
+        self._bind_btn(self._btn_spd_down, lambda e: self._step_speed(-1))
+        lbl_speed = _lbl(textvariable=self._speed_display_var, width=3, anchor="center")
+        self._btn_spd_up = _lbl("+", fg=self.DIM, cursor="hand2", width=2)
+        self._bind_btn(self._btn_spd_up, lambda e: self._step_speed(1))
+        canvas.create_window(W - 112, ymid, window=self._btn_spd_down, anchor="w")
+        canvas.create_window(W - 92, ymid, window=lbl_speed, anchor="w")
+        canvas.create_window(W - 58, ymid, window=self._btn_spd_up, anchor="w")
+        for w in (self._btn_spd_down, lbl_speed, self._btn_spd_up):
+            try:
+                w.configure(takefocus=0)
+            except Exception:
+                pass
 
         # ── style (compact) + gear ───────────────────────────────────────────
         self._style_var = tk.StringVar(value=REPHRASE_STYLES[self._style_idx])
@@ -1244,7 +1269,7 @@ class FloatingStatusBar:
             canvas, lbl_status, lbl_style, btn_gear,
             self._btn_read, self._btn_pause, self._btn_resume, self._btn_stop,
             self._btn_prev, self._btn_next, self._btn_back, self._btn_fwd,
-            self._speed_combo,
+            self._btn_ocr, self._btn_spd_down, self._btn_spd_up, lbl_speed,
         ):
             self._bind_context_menu(w)
 
@@ -1465,9 +1490,8 @@ class SettingsWindow:
         r += 1
 
         self._add_label(sec, "Speed", r)
-        speed_labels = [label for label, _ in SPEED_OPTIONS]
-        current_speed_label = SPEED_BY_VALUE.get(self._app.tts.current_speed, "Normal")
-        self._speed_var = tk.StringVar(value=current_speed_label)
+        speed_labels = [format_speed(p) for p in SPEED_PRESETS]
+        self._speed_var = tk.StringVar(value=format_speed(self._app.tts.current_speed))
         self._add_combo(sec, self._speed_var, speed_labels, r,
                         on_change=self._on_speed_changed)
 
@@ -1477,6 +1501,7 @@ class SettingsWindow:
 
         for label_text, attr_name, target_id in [
             ("Read aloud",  "_hotkey",           "read"),
+            ("OCR region",  "_ocr_hotkey",       "ocr"),
             ("Dictation",   "_dictation_hotkey",  "dictation"),
             ("Grammar",     "_grammar_hotkey",    "grammar"),
         ]:
@@ -1640,6 +1665,7 @@ class SettingsWindow:
         """Return the StringVar for a given recording target."""
         mapping = {
             "read": self._hotkey_var,
+            "ocr": self._ocr_hotkey_var,
             "dictation": self._dictation_hotkey_var,
             "grammar": self._grammar_hotkey_var,
             "recall_style": self._recall_style_hotkey_var,
@@ -1671,7 +1697,7 @@ class SettingsWindow:
         if label in self._en_labels:
             idx = self._en_labels.index(label)
             code = self._en_codes[idx]
-            speed = SPEED_BY_LABEL.get(self._speed_var.get(), DEFAULT_SPEED)
+            speed = parse_speed(self._speed_var.get())
             self._app.tts.stop()
             self._app.tts.set_speed(speed)
             self._app.tts.speak_preview("Hello! This is a preview.", code, "en-us")
@@ -1681,7 +1707,7 @@ class SettingsWindow:
         if label in self._es_labels:
             idx = self._es_labels.index(label)
             code = self._es_codes[idx]
-            speed = SPEED_BY_LABEL.get(self._speed_var.get(), DEFAULT_SPEED)
+            speed = parse_speed(self._speed_var.get())
             self._app.tts.stop()
             self._app.tts.set_speed(speed)
             self._app.tts.speak_preview("Hola, esta es una vista previa.", code, "es")
@@ -1693,7 +1719,7 @@ class SettingsWindow:
             code = self._en_codes[idx]
         else:
             code = self._app.tts.voice_en
-        speed = SPEED_BY_LABEL.get(self._speed_var.get(), DEFAULT_SPEED)
+        speed = parse_speed(self._speed_var.get())
         self._app.tts.stop()
         self._app.tts.set_speed(speed)
         self._app.tts.speak_preview("Hello! This is a preview.", code, "en-us")
@@ -1710,8 +1736,9 @@ class SettingsWindow:
         idx_es = self._es_labels.index(es_label) if es_label in self._es_labels else 0
         voice_es = self._es_codes[idx_es]
 
-        speed = SPEED_BY_LABEL.get(self._speed_var.get(), DEFAULT_SPEED)
+        speed = parse_speed(self._speed_var.get())
         hotkey = self._hotkey_var.get()
+        ocr_hotkey = self._ocr_hotkey_var.get().strip()
         dictation_hotkey = self._dictation_hotkey_var.get()
         grammar_hotkey = self._grammar_hotkey_var.get()
         rephrase_hotkey = ""
@@ -1774,6 +1801,8 @@ class SettingsWindow:
 
         if hotkey != self._app._hotkey:
             self._app._update_hotkey(hotkey)
+        if ocr_hotkey != self._app._ocr_hotkey:
+            self._app._update_ocr_hotkey(ocr_hotkey)
         if dictation_hotkey != self._app._dictation_hotkey:
             self._app._update_dictation_hotkey(dictation_hotkey)
         if grammar_hotkey != self._app._grammar_hotkey:
@@ -1801,6 +1830,7 @@ class SettingsWindow:
 
         save_config({
             "hotkey": hotkey,
+            "ocr_hotkey": ocr_hotkey,
             "dictation_hotkey": dictation_hotkey,
             "grammar_hotkey": grammar_hotkey,
             "rephrase_hotkey": rephrase_hotkey,
@@ -2155,6 +2185,7 @@ class TinyReadAloud:
     def __init__(self):
         cfg = load_config()
         self._hotkey = cfg["hotkey"]
+        self._ocr_hotkey = cfg.get("ocr_hotkey", OCR_HOTKEY)
         self._dictation_hotkey = cfg["dictation_hotkey"]
         self._grammar_hotkey = cfg["grammar_hotkey"]
         self._rephrase_hotkey = cfg["rephrase_hotkey"]
@@ -2171,11 +2202,12 @@ class TinyReadAloud:
         self.tts = TTSWorker()
         self.tts._voice_en = cfg["voice_en"]
         self.tts._voice_es = cfg["voice_es"]
-        self.tts._current_speed = cfg["speed"]
+        self.tts._current_speed = clamp_speed(cfg["speed"])
         self.tts.on_state_change = self._on_speaking_changed
         self.tts.on_playback_change = self._on_playback_changed
         self.icon = None
         self._hotkey_handle = None
+        self._ocr_hotkey_handle = None
         self._dictation_hotkey_handle = None
         self._grammar_hotkey_handle = None
         self._rephrase_hotkey_handle = None
@@ -2200,7 +2232,7 @@ class TinyReadAloud:
         self.icon = pystray.Icon(
             name="TinyReadAloud",
             icon=self._icon_idle,
-            title=f"TinyReadAloud v{__version__}  [Read: {self._hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}]",
+            title=f"TinyReadAloud v{__version__}  [Read: {self._hotkey} | OCR: {self._ocr_hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}]",
             menu=self._build_menu(),
         )
         self.icon.run(setup=self._on_ready)
@@ -2229,6 +2261,8 @@ class TinyReadAloud:
         icon.update_menu()
         self._hotkey_handle = self._safe_add_hotkey(
             self._hotkey, self._on_hotkey, "read")
+        self._ocr_hotkey_handle = self._safe_add_hotkey(
+            self._ocr_hotkey, self._on_ocr_hotkey, "OCR")
         self._dictation_hotkey_handle = self._safe_add_hotkey(
             self._dictation_hotkey, self._on_dictation_hotkey, "dictation")
         self._grammar_hotkey_handle = self._safe_add_hotkey(
@@ -2240,7 +2274,7 @@ class TinyReadAloud:
         self._status_bar = FloatingStatusBar.get()
         print(
             f"TinyReadAloud v{__version__} ready. "
-            f"Read: {self._hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}"
+            f"Read: {self._hotkey} | OCR: {self._ocr_hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}"
         )
         # Check for updates in background after 5 seconds
         threading.Timer(5.0, self._check_for_updates_background).start()
@@ -2263,6 +2297,8 @@ class TinyReadAloud:
                 self._cmd_stop,
                 enabled=playback_active,
             ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Read Region (OCR)…", self._cmd_ocr_region),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Next Sentence",
@@ -2334,12 +2370,12 @@ class TinyReadAloud:
         # Speed submenu
         speed_items = [
             pystray.MenuItem(
-                label,
+                format_speed(spd),
                 self._make_speed_setter(spd),
-                checked=lambda item, s=spd: self.tts.current_speed == s,
+                checked=lambda item, s=spd: abs(self.tts.current_speed - s) < 0.05,
                 radio=True,
             )
-            for label, spd in SPEED_OPTIONS
+            for spd in SPEED_PRESETS
         ]
         items.append(pystray.MenuItem("Speed", pystray.Menu(*speed_items)))
 
@@ -2371,6 +2407,7 @@ class TinyReadAloud:
 
     def set_reading_speed(self, speed, persist=True):
         """Apply TTS speed and sync toolbar, tray menu, and config."""
+        speed = clamp_speed(speed)
         self.tts.set_speed(speed)
         sb = FloatingStatusBar.get()
         if sb:
@@ -2392,6 +2429,51 @@ class TinyReadAloud:
             elif self._status_bar._last_target_hwnd:
                 target_hwnd = self._status_bar._last_target_hwnd
         self.start_read(target_hwnd)
+
+    def _on_ocr_hotkey(self):
+        self.start_ocr_read()
+
+    def start_ocr_read(self):
+        """Dim screen and let the user drag a region to OCR and read."""
+        if self.tts.is_active:
+            self.tts.stop()
+        if self._status_bar and self._status_bar._root:
+            try:
+                self._status_bar._root.withdraw()
+            except Exception:
+                pass
+        RegionSelectOverlay.pick(self._on_ocr_region_picked)
+
+    def _on_ocr_region_picked(self, bbox):
+        if self._status_bar and self._status_bar._root:
+            try:
+                self._status_bar._root.deiconify()
+            except Exception:
+                pass
+        if not bbox:
+            self._set_status("OCR cancelled.")
+            return
+        threading.Thread(
+            target=self._ocr_region_and_speak,
+            args=(bbox,),
+            daemon=True,
+        ).start()
+
+    def _ocr_region_and_speak(self, bbox):
+        self._set_status("OCR scanning…")
+        text = capture_ocr_region(bbox)
+        print(f"[OCR] region captured {len(text)} chars.", flush=True)
+        if not text:
+            self._set_status("No text in region.")
+            if self.icon:
+                self.icon.notify(
+                    "OCR found no text in that region. Try a larger selection.",
+                    "TinyReadAloud",
+                )
+            return
+        self._set_status("Read (OCR)…")
+        self._reset_hotkeys()
+        self.tts.speak(text)
 
     def start_read(self, target_hwnd=None):
         """Start reading selection, or stop if already playing."""
@@ -2535,33 +2617,20 @@ class TinyReadAloud:
 
         self._set_status("Capturing text…")
         text = capture_selected_text(target_hwnd)
-        method = "clipboard" if text else "none"
         if not text:
             self._set_status("Trying accessibility…")
             text = capture_via_accessibility(target_hwnd)
-            if text:
-                method = "uia"
-        if not text:
-            self._set_status("OCR scanning…")
-            text = capture_via_ocr(target_hwnd)
-            if text:
-                method = "ocr"
-        print(f"[Read] Captured {len(text)} chars via {method}.", flush=True)
+        print(f"[Read] Captured {len(text)} chars.", flush=True)
 
         if not text:
             self._set_status("Nothing selected.")
             if self.icon:
                 self.icon.notify(
-                    "No text captured. Highlight text, use a copy-friendly window, "
-                    "or ensure OCR language packs are installed.",
+                    "No text captured. Highlight text first, or use OCR "
+                    f"({self._ocr_hotkey} or toolbar OCR button).",
                     "TinyReadAloud",
                 )
             return
-
-        if method == "ocr":
-            self._set_status("Read (OCR)…")
-        elif method == "uia":
-            self._set_status("Read (accessibility)…")
 
         self._reset_hotkeys()
         self.tts.speak(text)
@@ -2663,6 +2732,9 @@ class TinyReadAloud:
         self.tts.stop()
         self._grammar_cancel.set()
         self._rephrase_cancel.set()
+
+    def _cmd_ocr_region(self, icon, item):
+        self.start_ocr_read()
 
     def _cmd_pause(self, icon, item):
         self.tts.pause()
@@ -2777,6 +2849,7 @@ class TinyReadAloud:
         recognised correctly."""
         for attr, hotkey, cb in (
             ("_hotkey_handle",           self._hotkey,           self._on_hotkey),
+            ("_ocr_hotkey_handle",         self._ocr_hotkey,       self._on_ocr_hotkey),
             ("_dictation_hotkey_handle", self._dictation_hotkey, self._on_dictation_hotkey),
             ("_grammar_hotkey_handle",   self._grammar_hotkey,   self._on_grammar_hotkey),
             ("_rephrase_hotkey_handle",  self._rephrase_hotkey,  self._on_rephrase_hotkey),
@@ -3105,7 +3178,30 @@ class TinyReadAloud:
         if new_hotkey:
             self._hotkey_handle = keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=False)
         if self.icon:
-            self.icon.title = f"TinyReadAloud v{__version__}  [Read: {self._hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}]"
+            self.icon.title = self._tray_title()
+
+    def _update_ocr_hotkey(self, new_hotkey):
+        if self._ocr_hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self._ocr_hotkey_handle)
+            except (KeyError, ValueError):
+                pass
+            self._ocr_hotkey_handle = None
+        self._ocr_hotkey = new_hotkey
+        if new_hotkey:
+            self._ocr_hotkey_handle = keyboard.add_hotkey(
+                self._ocr_hotkey, self._on_ocr_hotkey, suppress=False
+            )
+        if self.icon:
+            self.icon.title = self._tray_title()
+
+    def _tray_title(self):
+        return (
+            f"TinyReadAloud v{__version__}  "
+            f"[Read: {self._hotkey} | OCR: {self._ocr_hotkey} | "
+            f"Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | "
+            f"Rephrase: {self._rephrase_hotkey}]"
+        )
 
     def _update_dictation_hotkey(self, new_hotkey):
         if self._dictation_hotkey_handle is not None:

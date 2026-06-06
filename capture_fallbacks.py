@@ -1,4 +1,4 @@
-"""Fallback text capture when clipboard copy fails (UI Automation + Windows OCR)."""
+"""Fallback text capture: UI Automation, region OCR, and OCR text reflow."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import ctypes
 import ctypes.wintypes
 import io
+import re
 import sys
 
 user32 = ctypes.windll.user32
@@ -18,21 +19,50 @@ user32.IsWindow.argtypes = [ctypes.wintypes.HWND]
 user32.IsWindow.restype = ctypes.wintypes.BOOL
 
 
-def _window_client_bbox(hwnd):
-    """Return (left, top, width, height) of hwnd's client area in screen coords."""
-    if not hwnd or not user32.IsWindow(hwnd):
-        return None
-    rc = ctypes.wintypes.RECT()
-    if not user32.GetClientRect(hwnd, ctypes.byref(rc)):
-        return None
-    width = rc.right - rc.left
-    height = rc.bottom - rc.top
-    if width < 40 or height < 40:
-        return None
-    pt = ctypes.wintypes.POINT(0, 0)
-    if not user32.ClientToScreen(hwnd, ctypes.byref(pt)):
-        return None
-    return pt.x, pt.y, width, height
+def reflow_ocr_text(raw: str) -> str:
+    """Join OCR line breaks into readable sentences and fix hyphenation."""
+    if not raw:
+        return ""
+
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = re.split(r"\n\s*\n", text)
+    fixed_paragraphs = []
+
+    for para in paragraphs:
+        lines = [ln.strip() for ln in para.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        merged = lines[0]
+        for nxt in lines[1:]:
+            merged = _join_ocr_lines(merged, nxt)
+        fixed_paragraphs.append(re.sub(r" +", " ", merged).strip())
+
+    return "\n\n".join(fixed_paragraphs)
+
+
+def _join_ocr_lines(left: str, right: str) -> str:
+    if not left:
+        return right
+    if not right:
+        return left
+
+    # resolu- + tion  ->  resolution
+    if left.endswith("-") and right and right[0].islower():
+        return left[:-1] + right
+
+    # End-of-sentence or clause: keep as separate sentence start.
+    if left[-1] in ".!?":
+        return left + " " + right
+
+    # Continuation of same sentence (wrap): lowercase start or comma/colon end.
+    if right[0].islower() or left[-1] in ",:;":
+        return left + " " + right
+
+    # Digit continuation (e.g. page numbers split across lines).
+    if left[-1].isdigit() and right[0].isdigit():
+        return left + right
+
+    return left + " " + right
 
 
 def capture_via_accessibility(target_hwnd=None) -> str:
@@ -57,7 +87,6 @@ def capture_via_accessibility(target_hwnd=None) -> str:
         if focused is None:
             return ""
 
-        # Selected text in editable controls
         try:
             tp = focused.GetTextPattern()
             if tp:
@@ -76,7 +105,6 @@ def capture_via_accessibility(target_hwnd=None) -> str:
         except Exception:
             pass
 
-        # Whole value (single-line fields)
         try:
             vp = focused.GetValuePattern()
             if vp and not vp.IsReadOnly:
@@ -87,7 +115,6 @@ def capture_via_accessibility(target_hwnd=None) -> str:
         except Exception:
             pass
 
-        # Document pattern (some viewers / browsers)
         try:
             tp = focused.GetTextPattern()
             if tp and tp.DocumentRange:
@@ -107,12 +134,7 @@ def capture_via_accessibility(target_hwnd=None) -> str:
     return ""
 
 
-def _screenshot_client_area(hwnd):
-    """Grab a PIL RGB image of the window client area."""
-    bbox = _window_client_bbox(hwnd)
-    if not bbox:
-        return None
-    left, top, width, height = bbox
+def _screenshot_bbox(left, top, width, height):
     try:
         import mss
         from PIL import Image
@@ -120,9 +142,13 @@ def _screenshot_client_area(hwnd):
         print("[Capture] mss/Pillow not available — skip OCR screenshot", flush=True)
         return None
 
+    if width < 8 or height < 8:
+        return None
+
     try:
         with mss.mss() as sct:
-            shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
+            shot = sct.grab({"left": int(left), "top": int(top),
+                             "width": int(width), "height": int(height)})
             return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
     except Exception as exc:
         print(f"[Capture] screenshot failed: {exc}", flush=True)
@@ -156,7 +182,7 @@ async def _ocr_pil_async(pil_image) -> str:
     return (result.text or "").strip()
 
 
-def _ocr_pil_image(pil_image) -> str:
+def ocr_pil_image(pil_image) -> str:
     if sys.platform != "win32":
         return ""
     loop = asyncio.new_event_loop()
@@ -168,11 +194,9 @@ def _ocr_pil_image(pil_image) -> str:
         asyncio.set_event_loop(None)
 
 
-def capture_via_ocr(target_hwnd=None) -> str:
-    """OCR the target window client area when copy/UIA fail."""
-    if not target_hwnd or not user32.IsWindow(target_hwnd):
-        target_hwnd = user32.GetForegroundWindow()
-    if not target_hwnd:
+def capture_ocr_region(bbox) -> str:
+    """OCR a screen rectangle (left, top, width, height). Returns reflowed text."""
+    if not bbox:
         return ""
 
     try:
@@ -181,17 +205,19 @@ def capture_via_ocr(target_hwnd=None) -> str:
         print("[Capture] winrt OCR packages not installed — skip OCR", flush=True)
         return ""
 
-    image = _screenshot_client_area(target_hwnd)
+    left, top, width, height = bbox
+    image = _screenshot_bbox(left, top, width, height)
     if image is None:
         return ""
 
     try:
-        text = _ocr_pil_image(image)
+        raw = ocr_pil_image(image)
+        text = reflow_ocr_text(raw)
         if text:
-            print(f"[Capture] OCR ok len={len(text)}", flush=True)
+            print(f"[Capture] region OCR ok len={len(text)}", flush=True)
         else:
-            print("[Capture] OCR returned no text", flush=True)
+            print("[Capture] region OCR returned no text", flush=True)
         return text
     except Exception as exc:
-        print(f"[Capture] OCR failed: {exc}", flush=True)
+        print(f"[Capture] region OCR failed: {exc}", flush=True)
         return ""
