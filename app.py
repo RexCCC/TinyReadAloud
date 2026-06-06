@@ -753,8 +753,8 @@ def _lerp_rgb(c1, c2, t: float):
     return tuple(int(round(a + (b - a) * t)) for a, b in zip(c1, c2))
 
 
-def create_tray_icon(size=64, speaking=False):
-    """Render tray / app icon — Gemini dark theme with speaker + sound waves."""
+def _render_tray_icon_master(size: int, speaking: bool):
+    """Draw full-detail icon at native resolution (use size >= 128 for masters)."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     s = size
@@ -770,7 +770,6 @@ def create_tray_icon(size=64, speaking=False):
         width=line_w,
     )
 
-    # Aurora accent strip along the top inner edge
     strip_h = max(2, round(s / 12))
     x0 = pad + max(2, radius // 3)
     x1 = s - pad - max(2, radius // 3)
@@ -826,7 +825,7 @@ def create_tray_icon(size=64, speaking=False):
                 radius=max(1, w // 2),
                 fill=wave_rgb + (255,),
             )
-    elif s >= 24:
+    else:
         arc_w = max(1, round(2 * k))
         for rad in (round(9 * k), round(13 * k)):
             if wx + rad >= s - pad:
@@ -835,6 +834,15 @@ def create_tray_icon(size=64, speaking=False):
             draw.arc(bbox, start=-42, end=42, fill=wave_rgb + (210,), width=arc_w)
 
     return img
+
+
+def create_tray_icon(size=64, speaking=False):
+    """Render tray / app icon — downscale from 256px master for crisp small sizes."""
+    master_size = 256
+    if size >= master_size:
+        return _render_tray_icon_master(size, speaking)
+    master = _render_tray_icon_master(master_size, speaking)
+    return master.resize((size, size), Image.Resampling.LANCZOS)
 
 
 # ── Voice Helpers ────────────────────────────────────────────────────────────

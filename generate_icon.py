@@ -108,17 +108,14 @@ def render_banner(width: int, height: int) -> Image.Image:
 
 
 def _save_ico(path: str, sizes: list[int], speaking: bool = False):
-    images = [create_tray_icon(size=s, speaking=speaking) for s in sizes]
-    images[0].save(
-        path,
-        format="ICO",
-        append_images=images[1:],
-        sizes=[(s, s) for s in sizes],
-    )
+    """Write multi-resolution ICO (Pillow needs one master + sizes=, not append_images)."""
+    master = create_tray_icon(size=max(sizes), speaking=speaking)
+    master.save(path, format="ICO", sizes=[(s, s) for s in sizes])
 
 
 def main():
     os.makedirs(ASSETS, exist_ok=True)
+    # Windows 11 uses 16/24/32 heavily in Search and taskbar
     ico_sizes = [16, 24, 32, 48, 64, 128, 256]
 
     _save_ico(os.path.join(ASSETS, "app.ico"), ico_sizes)
