@@ -2230,6 +2230,11 @@ class TTSWorker:
         self._current_sentence_audio = None
         self._cached_sentence_idx = -1
         self._current_sample_rate = 24000
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_idx = -1
+        self._prefetch_audio = None
+        self._prefetch_sr = 24000
+        self._prefetch_gen = -1
         self.on_state_change = None
         self.on_playback_change = None
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -2291,6 +2296,7 @@ class TTSWorker:
         self._play_gen += 1
         self._current_sentence_audio = None
         self._cached_sentence_idx = -1
+        self._clear_prefetch()
         if self._speaking:
             self._set_speaking(False)
         self._notify_playback()
@@ -2426,6 +2432,58 @@ class TTSWorker:
                 self._set_speaking(False)
                 self._notify_playback()
 
+    def _clear_prefetch(self):
+        with self._prefetch_lock:
+            self._prefetch_idx = -1
+            self._prefetch_audio = None
+            self._prefetch_gen = -1
+
+    def _take_prefetched(self, idx: int, gen: int):
+        with self._prefetch_lock:
+            if (
+                self._prefetch_idx == idx
+                and self._prefetch_gen == gen
+                and self._prefetch_audio is not None
+            ):
+                audio, sr = self._prefetch_audio, self._prefetch_sr
+                self._prefetch_idx = -1
+                self._prefetch_audio = None
+                self._prefetch_gen = -1
+                return audio, sr
+        return None
+
+    def _start_prefetch(self, kokoro, idx: int, voice, kokoro_lang, gen: int):
+        if idx >= len(self._sentences):
+            return
+
+        def _worker():
+            try:
+                audio, sr = asyncio.run(
+                    self._synthesize_sentence(kokoro, self._sentences[idx], voice, kokoro_lang)
+                )
+            except Exception as exc:
+                print(f"[TTS] Prefetch failed for sentence {idx}: {exc}", flush=True)
+                return
+            if self._stop_event.is_set() or self._play_gen != gen:
+                return
+            with self._prefetch_lock:
+                if self._stop_event.is_set() or self._play_gen != gen:
+                    return
+                self._prefetch_idx = idx
+                self._prefetch_audio = audio
+                self._prefetch_sr = sr
+                self._prefetch_gen = gen
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _load_sentence_audio(self, kokoro, idx: int, voice, kokoro_lang, gen: int):
+        cached = self._take_prefetched(idx, gen)
+        if cached is not None:
+            return cached
+        return asyncio.run(
+            self._synthesize_sentence(kokoro, self._sentences[idx], voice, kokoro_lang)
+        )
+
     def _speak_session(self, kokoro, text, voice, kokoro_lang):
         self._sentences = split_sentences(text)
         if not self._sentences:
@@ -2439,6 +2497,7 @@ class TTSWorker:
         self._pause_wait.set()
         self._current_sentence_audio = None
         self._cached_sentence_idx = -1
+        self._clear_prefetch()
         self._set_speaking(True)
         self._notify_playback()
 
@@ -2446,14 +2505,17 @@ class TTSWorker:
             if self._stop_event.is_set():
                 break
 
-            if self._cached_sentence_idx != self._sentence_idx:
-                sent = self._sentences[self._sentence_idx]
-                audio, sr = asyncio.run(
-                    self._synthesize_sentence(kokoro, sent, voice, kokoro_lang)
-                )
+            gen = self._play_gen
+            idx = self._sentence_idx
+
+            if self._cached_sentence_idx != idx:
+                audio, sr = self._load_sentence_audio(kokoro, idx, voice, kokoro_lang, gen)
+                if self._stop_event.is_set() or self._play_gen != gen:
+                    continue
                 self._current_sentence_audio = audio
-                self._cached_sentence_idx = self._sentence_idx
+                self._cached_sentence_idx = idx
                 self._current_sample_rate = sr
+                self._start_prefetch(kokoro, idx + 1, voice, kokoro_lang, gen)
 
             audio = self._current_sentence_audio
             if audio is None or len(audio) == 0:
@@ -2462,7 +2524,6 @@ class TTSWorker:
                 self._cached_sentence_idx = -1
                 continue
 
-            gen = self._play_gen
             completed = self._play_audio_buffer(
                 audio, self._current_sample_rate, self._playhead, gen
             )
@@ -2470,6 +2531,7 @@ class TTSWorker:
             if self._stop_event.is_set():
                 break
             if self._play_gen != gen:
+                self._clear_prefetch()
                 continue
             if not completed:
                 break
@@ -2478,6 +2540,7 @@ class TTSWorker:
             self._playhead = 0
             self._cached_sentence_idx = -1
 
+        self._clear_prefetch()
         self._session_active = False
         self._paused = False
         self._pause_wait.set()
