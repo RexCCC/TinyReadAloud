@@ -148,7 +148,7 @@ def _screenshot_bbox(left, top, width, height):
     left, top, width, height = int(left), int(top), int(width), int(height)
 
     try:
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             virtual = sct.monitors[0]
             right = left + width
             bottom = top + height
@@ -191,7 +191,7 @@ async def _ocr_pil_async(pil_image) -> str:
 
     stream = InMemoryRandomAccessStream()
     writer = DataWriter(stream)
-    writer.write(png_bytes)
+    writer.write_bytes(png_bytes)
     await writer.store_async()
     await writer.flush_async()
     stream.seek(0)

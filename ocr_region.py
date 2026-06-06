@@ -18,7 +18,7 @@ def get_virtual_screen_bounds():
     """Return (left, top, width, height) spanning all monitors."""
     try:
         import mss
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             mon = sct.monitors[0]
             return mon["left"], mon["top"], mon["width"], mon["height"]
     except Exception:
