@@ -145,10 +145,35 @@ def _screenshot_bbox(left, top, width, height):
     if width < 8 or height < 8:
         return None
 
+    left, top, width, height = int(left), int(top), int(width), int(height)
+
     try:
         with mss.mss() as sct:
-            shot = sct.grab({"left": int(left), "top": int(top),
-                             "width": int(width), "height": int(height)})
+            virtual = sct.monitors[0]
+            right = left + width
+            bottom = top + height
+            vright = virtual["left"] + virtual["width"]
+            vbottom = virtual["top"] + virtual["height"]
+            left = max(virtual["left"], left)
+            top = max(virtual["top"], top)
+            right = min(vright, right)
+            bottom = min(vbottom, bottom)
+            width = right - left
+            height = bottom - top
+            if width < 8 or height < 8:
+                print(
+                    f"[Capture] region outside desktop: "
+                    f"{left},{top} {width}x{height}",
+                    flush=True,
+                )
+                return None
+            print(
+                f"[Capture] screenshot left={left} top={top} w={width} h={height}",
+                flush=True,
+            )
+            shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
+            if shot.width < 1 or shot.height < 1:
+                return None
             return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
     except Exception as exc:
         print(f"[Capture] screenshot failed: {exc}", flush=True)
@@ -161,7 +186,7 @@ async def _ocr_pil_async(pil_image) -> str:
     from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream
 
     bio = io.BytesIO()
-    pil_image.convert("RGBA").save(bio, format="PNG")
+    pil_image.convert("RGB").save(bio, format="PNG")
     png_bytes = bio.getvalue()
 
     stream = InMemoryRandomAccessStream()
@@ -176,7 +201,13 @@ async def _ocr_pil_async(pil_image) -> str:
 
     engine = OcrEngine.try_create_from_user_profile_languages()
     if engine is None:
-        raise RuntimeError("Windows OCR engine unavailable for profile languages")
+        try:
+            from winrt.windows.globalization import Language
+            engine = OcrEngine.try_create_from_language(Language("en-US"))
+        except Exception:
+            engine = None
+    if engine is None:
+        raise RuntimeError("Windows OCR engine unavailable (install a language pack)")
 
     result = await engine.recognize_async(software_bitmap)
     return (result.text or "").strip()
@@ -209,6 +240,18 @@ def capture_ocr_region(bbox) -> str:
     image = _screenshot_bbox(left, top, width, height)
     if image is None:
         return ""
+
+    # Upscale small captures — OCR accuracy improves with pixel density.
+    try:
+        from PIL import Image
+        if image.width < 240 or image.height < 80:
+            scale = 2
+            image = image.resize(
+                (image.width * scale, image.height * scale),
+                Image.Resampling.LANCZOS,
+            )
+    except Exception:
+        pass
 
     try:
         raw = ocr_pil_image(image)

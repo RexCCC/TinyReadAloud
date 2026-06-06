@@ -20,6 +20,16 @@ from capture_fallbacks import capture_via_accessibility, capture_ocr_region
 from ocr_region import RegionSelectOverlay
 from version import __version__
 
+# Per-monitor DPI so Tk mouse coords match mss screenshots (multi-monitor + scaling).
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 # When frozen as a windowless app (console=False), stdout/stderr are None.
 # Redirect to a log file so print() calls don't crash.
 if getattr(sys, 'frozen', False) and sys.stdout is None:
@@ -858,6 +868,32 @@ class FloatingStatusBar:
                 self._root.after(0, self._refresh_playback_ui)
             except Exception:
                 pass
+
+    def prepare_for_ocr_overlay(self):
+        """Hide toolbar visually without withdraw (avoids shrink on restore)."""
+        if not self._root:
+            return
+        try:
+            self._saved_geometry = self._root.geometry()
+            self._root.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+
+    def restore_after_ocr_overlay(self):
+        """Restore toolbar size/position after OCR region pick."""
+        if not self._root:
+            return
+        try:
+            geo = getattr(self, "_saved_geometry", None)
+            if geo:
+                self._root.geometry(geo)
+            else:
+                sw = self._root.winfo_screenwidth()
+                self._root.geometry(f"{self.W}x{self.H}+{(sw - self.W) // 2}+48")
+            self._root.attributes("-alpha", 0.95)
+            self._root.lift()
+        except Exception:
+            pass
 
     def _refresh_playback_ui(self):
         if not self._root or self._btn_read is None:
@@ -2437,19 +2473,15 @@ class TinyReadAloud:
         """Dim screen and let the user drag a region to OCR and read."""
         if self.tts.is_active:
             self.tts.stop()
+        parent = None
         if self._status_bar and self._status_bar._root:
-            try:
-                self._status_bar._root.withdraw()
-            except Exception:
-                pass
-        RegionSelectOverlay.pick(self._on_ocr_region_picked)
+            self._status_bar.prepare_for_ocr_overlay()
+            parent = self._status_bar._root
+        RegionSelectOverlay.pick(self._on_ocr_region_picked, parent_root=parent)
 
     def _on_ocr_region_picked(self, bbox):
-        if self._status_bar and self._status_bar._root:
-            try:
-                self._status_bar._root.deiconify()
-            except Exception:
-                pass
+        if self._status_bar:
+            self._status_bar.restore_after_ocr_overlay()
         if not bbox:
             self._set_status("OCR cancelled.")
             return
@@ -2460,6 +2492,8 @@ class TinyReadAloud:
         ).start()
 
     def _ocr_region_and_speak(self, bbox):
+        # Let overlay and toolbar fully disappear before grabbing pixels.
+        time.sleep(0.2)
         self._set_status("OCR scanning…")
         text = capture_ocr_region(bbox)
         print(f"[OCR] region captured {len(text)} chars.", flush=True)
