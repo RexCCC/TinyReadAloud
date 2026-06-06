@@ -16,20 +16,14 @@ from tkinter import messagebox, ttk
 import urllib.error
 import urllib.request
 
+import bootstrap
+
+bootstrap.configure_runtime()
+
 from capture_fallbacks import capture_via_accessibility, capture_ocr_region
 from ocr_region import RegionSelectOverlay
 from reliability import log_event, log_exception, new_trace_id, run_health_check
 from version import __version__
-
-# Per-monitor DPI so Tk mouse coords match mss screenshots (multi-monitor + scaling).
-if sys.platform == "win32":
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
 
 # When frozen as a windowless app (console=False), stdout/stderr are None.
 # Redirect to a log file so print() calls don't crash.
@@ -40,18 +34,6 @@ if getattr(sys, 'frozen', False) and sys.stdout is None:
     os.makedirs(_log_dir, exist_ok=True)
     sys.stdout = open(os.path.join(_log_dir, "tinyreadaloud.log"), "a", encoding="utf-8")
     sys.stderr = sys.stdout
-
-# Add pip-installed NVIDIA CUDA DLLs to PATH so onnxruntime can find them
-try:
-    import nvidia
-    _nv_root = os.path.dirname(nvidia.__path__[0] if hasattr(nvidia.__path__, '__iter__') else nvidia.__path__)
-    for _subpkg in ("cublas", "cuda_runtime", "cudnn", "cufft", "nvjitlink"):
-        _bin = os.path.join(_nv_root, "nvidia", _subpkg, "bin")
-        if os.path.isdir(_bin):
-            os.add_dll_directory(_bin)
-            os.environ["PATH"] = _bin + os.pathsep + os.environ.get("PATH", "")
-except ImportError:
-    pass
 
 import keyboard
 import numpy as np
