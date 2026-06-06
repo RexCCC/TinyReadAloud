@@ -1,6 +1,7 @@
-"""Generate assets/app.ico from the tray icon function in app.py."""
+"""Generate assets/app.ico and PNG previews from the tray icon renderer."""
 
 import os
+
 from app import create_tray_icon
 
 
@@ -14,7 +15,9 @@ def main():
         append_images=images[1:],
         sizes=[(s, s) for s in sizes],
     )
-    print("Created assets/app.ico")
+    create_tray_icon(size=256, speaking=False).save("assets/icon-idle-256.png", format="PNG")
+    create_tray_icon(size=256, speaking=True).save("assets/icon-speaking-256.png", format="PNG")
+    print("Created assets/app.ico, assets/icon-idle-256.png, assets/icon-speaking-256.png")
 
 
 if __name__ == "__main__":

@@ -94,6 +94,16 @@ class TestSplitSentences(unittest.TestCase):
         self.assertGreaterEqual(len(parts), 1)
 
 
+class TestAppIcon(unittest.TestCase):
+    def test_tray_icon_sizes(self):
+        for sz in (16, 64, 256):
+            idle = app_mod.create_tray_icon(size=sz, speaking=False)
+            talk = app_mod.create_tray_icon(size=sz, speaking=True)
+            self.assertEqual(idle.size, (sz, sz))
+            self.assertEqual(talk.size, (sz, sz))
+            self.assertEqual(idle.mode, "RGBA")
+
+
 class TestConfigDefaults(unittest.TestCase):
     def test_defaults_include_ocr_hotkey(self):
         with mock.patch.object(app_mod.os.path, "exists", return_value=False):

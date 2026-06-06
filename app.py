@@ -740,31 +740,99 @@ def split_sentences(text):
 
 # ── Icon ─────────────────────────────────────────────────────────────────────
 
+_ICON_BG = (30, 31, 32)
+_ICON_BORDER = (60, 64, 67)
+_ICON_FG = (232, 234, 237)
+_ICON_BLUE = (71, 150, 227)
+_ICON_PURPLE = (145, 119, 199)
+_ICON_ROSE = (202, 102, 115)
+_ICON_GREEN = (52, 211, 153)
+
+
+def _lerp_rgb(c1, c2, t: float):
+    return tuple(int(round(a + (b - a) * t)) for a, b in zip(c1, c2))
+
+
 def create_tray_icon(size=64, speaking=False):
+    """Render tray / app icon — Gemini dark theme with speaker + sound waves."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+    s = size
+    pad = max(1, round(s * 0.0625))
+    radius = max(3, round(s * 0.21))
+    line_w = max(1, round(s / 32))
 
-    bg = "#2ECC71" if speaking else "#E74C3C"
-    pad = 2
-    draw.ellipse([pad, pad, size - pad, size - pad], fill=bg)
-
-    cx, cy = size // 2, size // 2
-
-    # Speaker body
-    draw.rectangle([cx - 12, cy - 6, cx - 4, cy + 6], fill="white")
-    # Speaker cone
-    draw.polygon(
-        [(cx - 4, cy - 6), (cx + 6, cy - 14), (cx + 6, cy + 14), (cx - 4, cy + 6)],
-        fill="white",
+    draw.rounded_rectangle(
+        [pad, pad, s - pad - 1, s - pad - 1],
+        radius=radius,
+        fill=_ICON_BG + (255,),
+        outline=_ICON_BORDER + (255,),
+        width=line_w,
     )
 
+    # Aurora accent strip along the top inner edge
+    strip_h = max(2, round(s / 12))
+    x0 = pad + max(2, radius // 3)
+    x1 = s - pad - max(2, radius // 3)
+    span = max(x1 - x0, 1)
+    for i in range(span):
+        t = i / max(span - 1, 1)
+        if speaking:
+            rgb = _lerp_rgb(_ICON_GREEN, _ICON_BLUE, t)
+        elif t <= 0.55:
+            rgb = _lerp_rgb(_ICON_BLUE, _ICON_PURPLE, t / 0.55)
+        else:
+            rgb = _lerp_rgb(_ICON_PURPLE, _ICON_ROSE, (t - 0.55) / 0.45)
+        draw.line([(x0 + i, pad + 1), (x0 + i, pad + strip_h)], fill=rgb + (255,), width=1)
+
+    k = s / 64.0
+    cx, cy = s // 2, s // 2 + round(1 * k)
+    body_h = max(4, round(12 * k))
+    body_left = cx - round(14 * k)
+    body_right = cx - round(6 * k)
+    draw.rounded_rectangle(
+        [body_left, cy - body_h // 2, body_right, cy + body_h // 2],
+        radius=max(1, round(2 * k)),
+        fill=_ICON_FG + (255,),
+    )
+    cone_right = cx + round(7 * k)
+    cone_top = cy - round(10 * k)
+    cone_bot = cy + round(10 * k)
+    draw.polygon(
+        [
+            (body_right, cy - body_h // 2),
+            (cone_right, cone_top),
+            (cone_right, cone_bot),
+            (body_right, cy + body_h // 2),
+        ],
+        fill=_ICON_FG + (255,),
+    )
+
+    wave_rgb = _ICON_GREEN if speaking else _ICON_BLUE
+    wx = cone_right + round(2 * k)
     if speaking:
-        draw.rectangle([cx + 12, cy - 7, cx + 17, cy + 7], fill="white")
-        draw.rectangle([cx + 20, cy - 7, cx + 25, cy + 7], fill="white")
-    else:
-        for r in [14, 21]:
-            bbox = [cx + 6 - r, cy - r, cx + 6 + r, cy + r]
-            draw.arc(bbox, start=-35, end=35, fill="white", width=2)
+        for i, (h, w) in enumerate(
+            (
+                (round(8 * k), max(2, round(3 * k))),
+                (round(12 * k), max(2, round(3 * k))),
+                (round(16 * k), max(2, round(3 * k))),
+            )
+        ):
+            x = wx + i * max(2, round(3 * k))
+            if x + w >= s - pad:
+                break
+            draw.rounded_rectangle(
+                [x, cy - h // 2, x + w, cy + h // 2],
+                radius=max(1, w // 2),
+                fill=wave_rgb + (255,),
+            )
+    elif s >= 24:
+        arc_w = max(1, round(2 * k))
+        for rad in (round(9 * k), round(13 * k)):
+            if wx + rad >= s - pad:
+                continue
+            bbox = [wx - rad, cy - rad, wx + rad, cy + rad]
+            draw.arc(bbox, start=-42, end=42, fill=wave_rgb + (210,), width=arc_w)
 
     return img
 
