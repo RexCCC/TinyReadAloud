@@ -16,6 +16,10 @@ from tkinter import messagebox, ttk
 import urllib.error
 import urllib.request
 
+from capture_fallbacks import (
+    capture_via_accessibility,
+    capture_via_ocr,
+)
 from version import __version__
 
 # When frozen as a windowless app (console=False), stdout/stderr are None.
@@ -738,7 +742,7 @@ class FloatingStatusBar:
     DIM    = "#8892a0"
     ACCENT = "#a78bfa"
     SEP    = "#2d3748"
-    W, H   = 508, 36
+    W, H   = 588, 36
     RADIUS = 10
     _FONT  = ("Segoe UI", 9)
     _FONTB = ("Segoe UI", 9, "bold")
@@ -778,6 +782,9 @@ class FloatingStatusBar:
         self._last_target_hwnd = 0  # last foreground HWND that isn't the status bar
         self._btn_read = self._btn_pause = self._btn_resume = self._btn_stop = None
         self._btn_prev = self._btn_next = self._btn_back = self._btn_fwd = None
+        self._speed_var = None
+        self._speed_combo = None
+        self._context_menu = None
         try:
             self._style_idx = REPHRASE_STYLES.index(app._rephrase_style)
         except (ValueError, AttributeError):
@@ -802,6 +809,16 @@ class FloatingStatusBar:
         if self._root and self._style_var:
             try:
                 self._root.after(0, lambda s=style: self._style_var.set(s))
+            except Exception:
+                pass
+
+    def sync_speed(self, speed=None):
+        """Keep toolbar speed dropdown in sync with TTS speed."""
+        speed = speed if speed is not None else self._app.tts.current_speed
+        label = SPEED_BY_VALUE.get(speed, "Normal")
+        if self._root and self._speed_var:
+            try:
+                self._root.after(0, lambda l=label: self._speed_var.set(l))
             except Exception:
                 pass
 
@@ -865,6 +882,66 @@ class FloatingStatusBar:
 
     def _tb_skip_forward(self, _=None):
         self._app.tts.skip_seconds(SKIP_SECONDS)
+
+    def _on_speed_selected(self, _=None):
+        label = self._speed_var.get() if self._speed_var else "Normal"
+        speed = SPEED_BY_LABEL.get(label, DEFAULT_SPEED)
+        self._app.set_reading_speed(speed)
+
+    def _build_context_menu(self):
+        menu = tk.Menu(
+            self._root, tearoff=0,
+            bg=self.BG, fg=self.FG,
+            activebackground=self.ACCENT, activeforeground="#1a1a2e",
+            borderwidth=0,
+        )
+        menu.add_command(label="Read", command=self._tb_read)
+        menu.add_separator()
+        menu.add_command(label="Pause", command=self._tb_pause)
+        menu.add_command(label="Resume", command=self._tb_resume)
+        menu.add_command(label="Stop", command=self._tb_stop)
+        menu.add_separator()
+        menu.add_command(label="Previous Sentence", command=self._tb_prev_sentence)
+        menu.add_command(label="Next Sentence", command=self._tb_next_sentence)
+        menu.add_command(label=f"Skip -{SKIP_SECONDS}s", command=self._tb_skip_back)
+        menu.add_command(label=f"Skip +{SKIP_SECONDS}s", command=self._tb_skip_forward)
+        menu.add_separator()
+
+        speed_menu = tk.Menu(
+            menu, tearoff=0,
+            bg=self.BG, fg=self.FG,
+            activebackground=self.ACCENT, activeforeground="#1a1a2e",
+            borderwidth=0,
+        )
+        for label, spd in SPEED_OPTIONS:
+            speed_menu.add_command(
+                label=label,
+                command=lambda s=spd, l=label: self._set_speed_from_menu(s, l),
+            )
+        menu.add_cascade(label="Speed", menu=speed_menu)
+        menu.add_separator()
+        menu.add_command(label="Settings…", command=self._open_settings)
+        self._context_menu = menu
+        return menu
+
+    def _set_speed_from_menu(self, speed, label):
+        if self._speed_var:
+            self._speed_var.set(label)
+        self._app.set_reading_speed(speed)
+
+    def _show_context_menu(self, event):
+        if self._context_menu is None:
+            self._build_context_menu()
+        try:
+            self._context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self._context_menu.grab_release()
+            except Exception:
+                pass
+
+    def _bind_context_menu(self, widget):
+        widget.bind("<Button-3>", self._show_context_menu, add="+")
 
     def _bind_btn(self, btn, command, hover=True):
         btn.bind("<Button-1>", command)
@@ -1087,10 +1164,45 @@ class FloatingStatusBar:
         canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
         x += 6
 
+        # ── speed dropdown ───────────────────────────────────────────────────
+        speed_labels = [label for label, _ in SPEED_OPTIONS]
+        current_label = SPEED_BY_VALUE.get(self._app.tts.current_speed, "Normal")
+        self._speed_var = tk.StringVar(value=current_label)
+        style = ttk.Style(root)
+        style.theme_use("clam")
+        style.configure(
+            "Bar.TCombobox",
+            fieldbackground="#282840",
+            background=self.BG,
+            foreground=self.FG,
+            arrowcolor=self.DIM,
+            bordercolor=self.SEP,
+            lightcolor=self.BG,
+            darkcolor=self.BG,
+        )
+        self._speed_combo = ttk.Combobox(
+            root,
+            textvariable=self._speed_var,
+            values=speed_labels,
+            state="readonly",
+            width=9,
+            style="Bar.TCombobox",
+        )
+        self._speed_combo.bind("<<ComboboxSelected>>", self._on_speed_selected)
+        canvas.create_window(x, ymid, window=self._speed_combo, anchor="w")
+        try:
+            self._speed_combo.configure(takefocus=0)
+        except Exception:
+            pass
+        x += 78
+
+        canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
+        x += 6
+
         # ── status label ─────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="Ready")
         lbl_status = _lbl(textvariable=self._status_var,
-                          fg=self.DIM, width=12, anchor="w")
+                          fg=self.DIM, width=10, anchor="w")
         self._place_btn(canvas, lbl_status, x, ymid)
 
         # ── style (compact) + gear ───────────────────────────────────────────
@@ -1126,6 +1238,15 @@ class FloatingStatusBar:
         for w in (canvas, lbl_status):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
+
+        self._build_context_menu()
+        for w in (
+            canvas, lbl_status, lbl_style, btn_gear,
+            self._btn_read, self._btn_pause, self._btn_resume, self._btn_stop,
+            self._btn_prev, self._btn_next, self._btn_back, self._btn_fwd,
+            self._speed_combo,
+        ):
+            self._bind_context_menu(w)
 
         self._refresh_playback_ui()
         root.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -1649,7 +1770,7 @@ class SettingsWindow:
         # Apply
         self._app.tts.set_voice_en(voice_en)
         self._app.tts.set_voice_es(voice_es)
-        self._app.tts.set_speed(speed)
+        self._app.set_reading_speed(speed, persist=False)
 
         if hotkey != self._app._hotkey:
             self._app._update_hotkey(hotkey)
@@ -2245,8 +2366,23 @@ class TinyReadAloud:
 
     def _make_speed_setter(self, speed):
         def setter(icon, item):
-            self.tts.set_speed(speed)
+            self.set_reading_speed(speed)
         return setter
+
+    def set_reading_speed(self, speed, persist=True):
+        """Apply TTS speed and sync toolbar, tray menu, and config."""
+        self.tts.set_speed(speed)
+        sb = FloatingStatusBar.get()
+        if sb:
+            sb.sync_speed(speed)
+        if persist:
+            try:
+                cfg = load_config()
+                cfg["speed"] = speed
+                save_config(cfg)
+            except Exception:
+                pass
+        self._refresh_menu()
 
     def _on_hotkey(self):
         target_hwnd = user32.GetForegroundWindow()
@@ -2397,18 +2533,35 @@ class TinyReadAloud:
             ) or user32.GetForegroundWindow()
         print(f"[Read] Hotkey fired. target_hwnd={target_hwnd:#010x}", flush=True)
 
+        self._set_status("Capturing text…")
         text = capture_selected_text(target_hwnd)
-        print(f"[Read] Captured {len(text)} chars.", flush=True)
+        method = "clipboard" if text else "none"
+        if not text:
+            self._set_status("Trying accessibility…")
+            text = capture_via_accessibility(target_hwnd)
+            if text:
+                method = "uia"
+        if not text:
+            self._set_status("OCR scanning…")
+            text = capture_via_ocr(target_hwnd)
+            if text:
+                method = "ocr"
+        print(f"[Read] Captured {len(text)} chars via {method}.", flush=True)
 
         if not text:
             self._set_status("Nothing selected.")
             if self.icon:
                 self.icon.notify(
-                    "No text captured. Highlight text in your editor first, "
-                    "then click Read or press Ctrl+Alt+R.",
+                    "No text captured. Highlight text, use a copy-friendly window, "
+                    "or ensure OCR language packs are installed.",
                     "TinyReadAloud",
                 )
             return
+
+        if method == "ocr":
+            self._set_status("Read (OCR)…")
+        elif method == "uia":
+            self._set_status("Read (accessibility)…")
 
         self._reset_hotkeys()
         self.tts.speak(text)
