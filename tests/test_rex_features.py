@@ -185,6 +185,18 @@ class TestDependencies(unittest.TestCase):
             __import__(mod)
 
 
+class TestOcrRegionPick(unittest.TestCase):
+    def test_release_without_press_is_ignored(self):
+        self.assertIsNone(ocr_mod.RegionSelectOverlay.bbox_from_drag(0, 0, 800, 600, armed=False))
+
+    def test_valid_drag_returns_bbox(self):
+        bbox = ocr_mod.RegionSelectOverlay.bbox_from_drag(100, 100, 400, 300, armed=True)
+        self.assertEqual(bbox, (100, 100, 300, 200))
+
+    def test_tiny_drag_returns_none(self):
+        self.assertIsNone(ocr_mod.RegionSelectOverlay.bbox_from_drag(0, 0, 10, 10, armed=True))
+
+
 class TestToolbarGeometry(unittest.TestCase):
     def test_prepare_restore_keeps_width(self):
         import tkinter as tk

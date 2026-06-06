@@ -39,12 +39,30 @@ class RegionSelectOverlay:
     FILL = "#ffffff"
     HINT = "Drag to select text on any monitor.  Esc = cancel"
 
+    OVERLAY_DEFER_MS = 120  # let toolbar button mouse-up finish before overlay shows
+
+    @staticmethod
+    def bbox_from_drag(x0, y0, x1, y1, armed: bool):
+        """Return screen bbox or None. Requires armed=True (press started on overlay)."""
+        if not armed:
+            return None
+        left = min(x0, x1)
+        top = min(y0, y1)
+        width = abs(x1 - x0)
+        height = abs(y1 - y0)
+        if width >= RegionSelectOverlay.MIN_SIZE and height >= RegionSelectOverlay.MIN_SIZE:
+            return int(left), int(top), int(width), int(height)
+        return None
+
     @classmethod
     def pick(cls, on_result, parent_root=None):
         """Start region pick. Prefer parent_root (toolbar Tk) to avoid a second Tk()."""
         if parent_root is not None:
             try:
-                parent_root.after(0, lambda: cls._run_toplevel(parent_root, on_result))
+                parent_root.after(
+                    cls.OVERLAY_DEFER_MS,
+                    lambda: cls._run_toplevel(parent_root, on_result),
+                )
                 return
             except Exception:
                 pass
@@ -97,7 +115,7 @@ class RegionSelectOverlay:
         )
         hint.place(relx=0.5, y=24, anchor="n")
 
-        state = {"x0": 0, "y0": 0, "rect": None, "fill": None}
+        state = {"x0": 0, "y0": 0, "rect": None, "fill": None, "armed": False}
         result = {"bbox": None}
 
         def _screen_to_canvas(x_root, y_root):
@@ -112,10 +130,13 @@ class RegionSelectOverlay:
                 state["fill"] = None
 
         def _on_press(event):
+            state["armed"] = True
             state["x0"], state["y0"] = event.x_root, event.y_root
             _clear()
 
         def _on_motion(event):
+            if not state["armed"]:
+                return
             _clear()
             x0, y0 = state["x0"], state["y0"]
             x1, y1 = event.x_root, event.y_root
@@ -142,16 +163,13 @@ class RegionSelectOverlay:
                 pass
 
         def _on_release(event):
-            x0, y0 = state["x0"], state["y0"]
-            x1, y1 = event.x_root, event.y_root
-            left = min(x0, x1)
-            top = min(y0, y1)
-            width = abs(x1 - x0)
-            height = abs(y1 - y0)
-            if width >= cls.MIN_SIZE and height >= cls.MIN_SIZE:
-                _finish((int(left), int(top), int(width), int(height)))
-            else:
-                _finish(None)
+            if not state["armed"]:
+                return
+            state["armed"] = False
+            bbox = cls.bbox_from_drag(
+                state["x0"], state["y0"], event.x_root, event.y_root, armed=True,
+            )
+            _finish(bbox)
 
         def _on_escape(_event=None):
             _finish(None)

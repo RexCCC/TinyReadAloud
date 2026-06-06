@@ -1041,11 +1041,11 @@ class FloatingStatusBar:
             btn.bind("<Leave>", _on_leave)
 
     def _bind_pill(self, wrap, lbl, command, default_bg, hover_bg,
-                   default_fg=None, hover_fg=None):
+                   default_fg=None, hover_fg=None, trigger="<Button-1>"):
         default_fg = default_fg or lbl.cget("fg")
         hover_fg = hover_fg or self.FG
         for w in (wrap, lbl):
-            w.bind("<Button-1>", command)
+            w.bind(trigger, command)
             w.bind("<Enter>", lambda _e: (
                 wrap.config(bg=hover_bg), lbl.config(bg=hover_bg, fg=hover_fg)
             ))
@@ -1249,7 +1249,8 @@ class FloatingStatusBar:
                 kw["anchor"] = anchor
             return tk.Label(parent, **kw)
 
-        def _pill(parent, text, pill_bg, pill_hover, fg, cmd, bold=False, padx=10):
+        def _pill(parent, text, pill_bg, pill_hover, fg, cmd, bold=False, padx=10,
+                  trigger_on_release=False):
             wrap = tk.Frame(parent, bg=pill_bg, bd=0, highlightthickness=0)
             lbl = tk.Label(
                 wrap, text=text, bg=pill_bg, fg=fg,
@@ -1257,7 +1258,8 @@ class FloatingStatusBar:
                 cursor="hand2", bd=0, padx=padx, pady=4,
             )
             lbl.pack()
-            self._bind_pill(wrap, lbl, cmd, pill_bg, pill_hover, default_fg=fg)
+            trigger = "<ButtonRelease-1>" if trigger_on_release else "<Button-1>"
+            self._bind_pill(wrap, lbl, cmd, pill_bg, pill_hover, default_fg=fg, trigger=trigger)
             wrap.pack(side=tk.LEFT, padx=(0, 4))
             return wrap, lbl
 
@@ -1307,7 +1309,7 @@ class FloatingStatusBar:
 
         self._pill_ocr, self._btn_ocr = _pill(
             left, "OCR", self.PILL_OCR, self.PILL_OCR_H, self.ACCENT2,
-            self._tb_ocr, bold=True, padx=8,
+            self._tb_ocr, bold=True, padx=8, trigger_on_release=True,
         )
 
         # Status — flexible center
