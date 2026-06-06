@@ -105,6 +105,7 @@ class TestConfigDefaults(unittest.TestCase):
             cfg = app_mod.load_config()
         self.assertEqual(cfg["toolbar_alpha"], app_mod.DEFAULT_TOOLBAR_ALPHA)
         self.assertTrue(cfg["toolbar_visible"])
+        self.assertFalse(cfg["stop_reading_on_keypress"])
 
     def test_save_load_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:

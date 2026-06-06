@@ -69,6 +69,13 @@ DEFAULT_TOOLBAR_ALPHA = 0.5
 DEFAULT_TOOLBAR_VISIBLE = True
 TOOLBAR_ALPHA_MIN = 0.15
 TOOLBAR_ALPHA_HOVER = 1.0
+DEFAULT_STOP_READING_ON_KEYPRESS = False
+PLAYBACK_KEY_DEBOUNCE_SEC = 1.0
+PLAYBACK_MODIFIER_KEYS = frozenset({
+    "ctrl", "alt", "shift",
+    "left ctrl", "right ctrl", "left alt", "right alt",
+    "left shift", "right shift",
+})
 COPY_WAIT_INTERVAL = 0.02
 COPY_WAIT_TIMEOUT = 1.5
 AUDIO_CHUNK_SECS = 0.05  # 50ms playback granularity for stop responsiveness
@@ -326,7 +333,8 @@ def load_config():
                 "anthropic_api_key": "",
                 "anthropic_model": ANTHROPIC_MODEL_DEFAULT,
                 "toolbar_alpha": DEFAULT_TOOLBAR_ALPHA,
-                "toolbar_visible": DEFAULT_TOOLBAR_VISIBLE}
+                "toolbar_visible": DEFAULT_TOOLBAR_VISIBLE,
+                "stop_reading_on_keypress": DEFAULT_STOP_READING_ON_KEYPRESS}
     if not os.path.exists(CONFIG_PATH):
         return defaults
     try:
@@ -1785,6 +1793,17 @@ class SettingsWindow:
         self._speed_var = tk.StringVar(value=format_speed(self._app.tts.current_speed))
         self._add_combo(sec, self._speed_var, speed_labels, r,
                         on_change=self._on_speed_changed)
+        r += 1
+
+        self._stop_on_key_var = tk.BooleanVar(value=self._app._stop_reading_on_keypress)
+        tk.Checkbutton(
+            sec,
+            text="Stop reading when typing (any key). Esc always stops.",
+            variable=self._stop_on_key_var,
+            bg=self.BG2, fg=self.FG, selectcolor=self.ENTRY_BG,
+            activebackground=self.BG2, activeforeground=self.FG,
+            font=("Segoe UI", 9), anchor="w",
+        ).grid(row=r, column=0, columnspan=4, sticky="w", padx=10, pady=(2, 6))
 
         # ── Shortcuts ──
         sec = self._make_section(left_col, "Shortcuts")
@@ -2074,6 +2093,7 @@ class SettingsWindow:
         anthropic_api_key = self._anthropic_api_key_var.get().strip()
         anthropic_model = self._anthropic_model_var.get().strip() or ANTHROPIC_MODEL_DEFAULT
         toolbar_alpha = clamp_toolbar_alpha(self._toolbar_alpha_pct_var.get() / 100.0)
+        stop_reading_on_keypress = bool(self._stop_on_key_var.get())
 
         # Collect per-style hotkeys
         style_hotkeys = {}
@@ -2149,6 +2169,7 @@ class SettingsWindow:
             _sb.sync_style()
             _sb.set_rest_alpha(toolbar_alpha)
         self._app._toolbar_alpha = toolbar_alpha
+        self._app._stop_reading_on_keypress = stop_reading_on_keypress
         self._app._anthropic_api_key = anthropic_api_key
         self._app._anthropic_model = anthropic_model
         self._app._refresh_menu()
@@ -2173,6 +2194,7 @@ class SettingsWindow:
             "anthropic_model": anthropic_model,
             "toolbar_alpha": toolbar_alpha,
             "toolbar_visible": self._app._toolbar_visible,
+            "stop_reading_on_keypress": stop_reading_on_keypress,
         })
 
         self._on_close()
@@ -2526,6 +2548,9 @@ class TinyReadAloud:
         self._recall_style_hotkey = cfg.get("recall_style_hotkey", RECALL_STYLE_HOTKEY)
         self._toolbar_alpha = clamp_toolbar_alpha(cfg.get("toolbar_alpha", DEFAULT_TOOLBAR_ALPHA))
         self._toolbar_visible = bool(cfg.get("toolbar_visible", DEFAULT_TOOLBAR_VISIBLE))
+        self._stop_reading_on_keypress = bool(
+            cfg.get("stop_reading_on_keypress", DEFAULT_STOP_READING_ON_KEYPRESS)
+        )
         self._last_rephrase_style = self._rephrase_style
         self._anthropic_api_key = cfg["anthropic_api_key"]
         self._anthropic_model = cfg["anthropic_model"]
@@ -3031,22 +3056,15 @@ class TinyReadAloud:
                 self._icon_speaking if is_speaking else self._icon_idle
             )
         self._update_playback_status()
-        # Any-key-stops-playback (not while paused)
         if is_speaking and not self.tts.is_paused:
             self._speaking_since = time.monotonic()
             try:
-                self._anykey_hook = keyboard.on_press(self._on_anykey_stop)
+                self._anykey_hook = keyboard.on_press(self._on_playback_key)
             except Exception:
                 pass
         else:
-            hook = self._anykey_hook
-            if hook is not None:
-                try:
-                    keyboard.unhook(hook)
-                except (KeyError, ValueError):
-                    pass
-                self._anykey_hook = None
-            # After stopping via any-key press, run grammar check
+            self._unhook_playback_key()
+            # After stopping via any-key (not Esc), run grammar check when enabled
             if self._stopped_by_key:
                 self._stopped_by_key = False
                 if self._grammar_mode != "off":
@@ -3062,6 +3080,15 @@ class TinyReadAloud:
                     )
                     self._grammar_thread = t
                     t.start()
+
+    def _unhook_playback_key(self):
+        hook = self._anykey_hook
+        if hook is not None:
+            try:
+                keyboard.unhook(hook)
+            except (KeyError, ValueError):
+                pass
+            self._anykey_hook = None
 
     def _on_playback_changed(self):
         self._update_playback_status()
@@ -3081,18 +3108,19 @@ class TinyReadAloud:
         else:
             self._set_status("Ready")
 
-    def _on_anykey_stop(self, event):
-        """Stop TTS playback when any key is pressed."""
+    def _on_playback_key(self, event):
+        """Esc always stops playback; other keys only if stop_reading_on_keypress."""
         if self.tts.is_paused:
             return
-        if time.monotonic() - self._speaking_since < 1.0:
-            return  # ignore keys from the hotkey that triggered playback
+        if time.monotonic() - self._speaking_since < PLAYBACK_KEY_DEBOUNCE_SEC:
+            return
         name = (getattr(event, "name", "") or "").lower()
-        if name in {
-            "ctrl", "alt", "shift",
-            "left ctrl", "right ctrl", "left alt", "right alt",
-            "left shift", "right shift",
-        }:
+        if name in PLAYBACK_MODIFIER_KEYS:
+            return
+        if name == "esc":
+            self.tts.stop()
+            return
+        if not self._stop_reading_on_keypress:
             return
         self._stopped_by_key = True
         self.tts.stop()
