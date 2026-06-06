@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+venv/
 build/
 dist/
 installer_output/
@@ -8,3 +9,4 @@ assets/app.ico
 *.bin
 config.json
 tmpclaude-*
+.instance.lock

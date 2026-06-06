@@ -6,6 +6,7 @@ import ctypes.wintypes
 import json
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -69,8 +70,9 @@ DEFAULT_STYLE_HOTKEYS = {s: "" for s in REPHRASE_STYLES}
 RECALL_STYLE_HOTKEY = ""
 DEFAULT_MIC_DEVICE = ""  # empty = system default
 COPY_WAIT_INTERVAL = 0.02
-COPY_WAIT_TIMEOUT = 0.5
+COPY_WAIT_TIMEOUT = 1.5
 AUDIO_CHUNK_SECS = 0.05  # 50ms playback granularity for stop responsiveness
+SKIP_SECONDS = 10
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL_DEFAULT = "claude-sonnet-4-6"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -125,6 +127,17 @@ user32.GetForegroundWindow.argtypes = []
 user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
 user32.SetForegroundWindow.argtypes = [ctypes.wintypes.HWND]
 user32.SetForegroundWindow.restype = ctypes.wintypes.BOOL
+user32.BringWindowToTop.argtypes = [ctypes.wintypes.HWND]
+user32.BringWindowToTop.restype = ctypes.wintypes.BOOL
+user32.AttachThreadInput.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.wintypes.BOOL]
+user32.AttachThreadInput.restype = ctypes.wintypes.BOOL
+user32.SendMessageW.argtypes = [
+    ctypes.wintypes.HWND, ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+]
+user32.SendMessageW.restype = ctypes.c_longlong
+user32.GetClipboardSequenceNumber.argtypes = []
+user32.GetClipboardSequenceNumber.restype = ctypes.wintypes.DWORD
 kernel32.GlobalAlloc.argtypes = [ctypes.wintypes.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
@@ -451,12 +464,50 @@ def rephrase_text(text, provider, api_key="", model="", style=""):
 
 # ── Clipboard ────────────────────────────────────────────────────────────────
 
-def _open_clipboard(retries=2):
+def _open_clipboard(retries=8):
     for i in range(retries):
         if user32.OpenClipboard(0):
             return True
         time.sleep(0.05)
     return False
+
+
+WM_COPY = 0x0301
+
+
+def _get_focus_for_window(hwnd):
+    """Return the child HWND with keyboard focus for hwnd's thread."""
+    if not hwnd:
+        return 0
+    tid = user32.GetWindowThreadProcessId(hwnd, None)
+    gti = GUITHREADINFO()
+    gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+    if user32.GetGUIThreadInfo(tid, ctypes.byref(gti)) and gti.hwndFocus:
+        return gti.hwndFocus
+    return hwnd
+
+
+def _focus_window(hwnd):
+    """Bring hwnd to foreground (works better with Electron apps like Cursor)."""
+    if not hwnd:
+        return False
+    fg = user32.GetForegroundWindow()
+    if fg == hwnd:
+        return True
+    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    attached = False
+    try:
+        if fg_thread and target_thread and fg_thread != target_thread:
+            user32.AttachThreadInput(fg_thread, target_thread, True)
+            attached = True
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(fg_thread, target_thread, False)
+    time.sleep(0.15)
+    return True
 
 
 def clipboard_get_text():
@@ -468,8 +519,13 @@ def clipboard_get_text():
         handle = user32.GetClipboardData(CF_UNICODETEXT)
         if not handle:
             return ""
-        ptr = ctypes.c_wchar_p(handle)
-        return ptr.value or ""
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr) or ""
+        finally:
+            kernel32.GlobalUnlock(handle)
     finally:
         user32.CloseClipboard()
 
@@ -502,33 +558,96 @@ def clipboard_set_text(text):
 
 def clipboard_clear():
     if not _open_clipboard():
-        return
+        return False
     try:
         user32.EmptyClipboard()
+        return True
     finally:
         user32.CloseClipboard()
 
 
-def capture_selected_text():
-    old = clipboard_get_text()
-    clipboard_clear()
-    keyboard.send("ctrl+c")
+def _clipboard_seq():
+    try:
+        return user32.GetClipboardSequenceNumber()
+    except Exception:
+        return 0
 
-    elapsed = 0.0
-    text = ""
-    while elapsed < COPY_WAIT_TIMEOUT:
-        time.sleep(COPY_WAIT_INTERVAL)
-        elapsed += COPY_WAIT_INTERVAL
-        text = clipboard_get_text()
+
+def _try_wm_copy(hwnd):
+    if not hwnd:
+        return False
+    try:
+        user32.SendMessageW(hwnd, WM_COPY, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
+def capture_selected_text(target_hwnd=None):
+    """Copy the current selection from target_hwnd into a string."""
+    _wait_for_modifiers_released()
+    old = clipboard_get_text()
+
+    for attempt in range(4):
+        if target_hwnd:
+            _focus_window(target_hwnd)
+            time.sleep(0.12 + attempt * 0.05)
+
+        for _ in range(8):
+            if clipboard_clear():
+                break
+            time.sleep(0.04)
+        time.sleep(0.06)
+
+        focus_hwnd = _get_focus_for_window(
+            target_hwnd or user32.GetForegroundWindow()
+        )
+        copy_targets = []
+        for hwnd in (focus_hwnd, target_hwnd):
+            if hwnd and hwnd not in copy_targets:
+                copy_targets.append(hwnd)
+
+        copied = False
+        for hwnd in copy_targets:
+            seq_before = _clipboard_seq()
+            _try_wm_copy(hwnd)
+            time.sleep(0.08)
+            if _clipboard_seq() != seq_before:
+                copied = True
+                break
+
+        if not copied:
+            seq_before = _clipboard_seq()
+            keyboard.send("ctrl+c")
+            deadline = time.monotonic() + COPY_WAIT_TIMEOUT
+            while time.monotonic() < deadline:
+                time.sleep(COPY_WAIT_INTERVAL)
+                if _clipboard_seq() != seq_before:
+                    copied = True
+                    break
+
+        text = clipboard_get_text().strip() if copied else ""
         if text:
-            break
+            print(f"[Read] capture ok attempt={attempt + 1} len={len(text)}", flush=True)
+            return text
+
+        print(f"[Read] capture attempt {attempt + 1} failed", flush=True)
+        time.sleep(0.1)
 
     if old:
         clipboard_set_text(old)
-    else:
-        clipboard_clear()
+    print("[Read] capture failed after retries", flush=True)
+    return ""
 
-    return text.strip()
+
+def split_sentences(text):
+    """Split text into sentence chunks for skip navigation."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?…])\s+", text)
+    sentences = [p.strip() for p in parts if p.strip()]
+    return sentences if sentences else [text]
 
 
 # ── Icon ─────────────────────────────────────────────────────────────────────
@@ -619,7 +738,7 @@ class FloatingStatusBar:
     DIM    = "#8892a0"
     ACCENT = "#a78bfa"
     SEP    = "#2d3748"
-    W, H   = 300, 36
+    W, H   = 508, 36
     RADIUS = 10
     _FONT  = ("Segoe UI", 9)
     _FONTB = ("Segoe UI", 9, "bold")
@@ -657,6 +776,8 @@ class FloatingStatusBar:
         self._drag_x = self._drag_y = 0
         self._own_hwnd = 0          # set once the Tk window is created
         self._last_target_hwnd = 0  # last foreground HWND that isn't the status bar
+        self._btn_read = self._btn_pause = self._btn_resume = self._btn_stop = None
+        self._btn_prev = self._btn_next = self._btn_back = self._btn_fwd = None
         try:
             self._style_idx = REPHRASE_STYLES.index(app._rephrase_style)
         except (ValueError, AttributeError):
@@ -683,6 +804,83 @@ class FloatingStatusBar:
                 self._root.after(0, lambda s=style: self._style_var.set(s))
             except Exception:
                 pass
+
+    def update_playback_controls(self):
+        """Refresh playback button states (thread-safe)."""
+        if self._root:
+            try:
+                self._root.after(0, self._refresh_playback_ui)
+            except Exception:
+                pass
+
+    def _refresh_playback_ui(self):
+        if not self._root or self._btn_read is None:
+            return
+        tts = self._app.tts
+        active = tts.is_active
+        paused = tts.is_paused
+        self._btn_read.config(
+            state="normal",
+            fg=self.ACCENT,
+            text="Stop" if active else "Read",
+        )
+        for btn, enabled in (
+            (self._btn_pause, active and not paused),
+            (self._btn_resume, paused),
+            (self._btn_stop, active),
+            (self._btn_prev, active),
+            (self._btn_next, active),
+            (self._btn_back, active),
+            (self._btn_fwd, active),
+        ):
+            btn.config(
+                state="normal" if enabled else "disabled",
+                fg=self.ACCENT if enabled else self.DIM,
+            )
+
+    # ── Playback toolbar actions ─────────────────────────────────────────────
+
+    def _tb_read(self, _=None):
+        """Read selected text from the last editor window (same as Ctrl+Alt+R)."""
+        target = self._last_target_hwnd or user32.GetForegroundWindow()
+        self._app.start_read(target)
+
+    def _tb_pause(self, _=None):
+        self._app.tts.pause()
+
+    def _tb_resume(self, _=None):
+        self._app.tts.resume()
+
+    def _tb_stop(self, _=None):
+        self._app.tts.stop()
+
+    def _tb_prev_sentence(self, _=None):
+        self._app.tts.prev_sentence()
+
+    def _tb_next_sentence(self, _=None):
+        self._app.tts.next_sentence()
+
+    def _tb_skip_back(self, _=None):
+        self._app.tts.skip_seconds(-SKIP_SECONDS)
+
+    def _tb_skip_forward(self, _=None):
+        self._app.tts.skip_seconds(SKIP_SECONDS)
+
+    def _bind_btn(self, btn, command, hover=True):
+        btn.bind("<Button-1>", command)
+        if hover:
+            btn.bind("<Enter>", lambda e: btn.config(
+                fg=self.ACCENT if btn.cget("state") == "normal" else self.DIM))
+            btn.bind("<Leave>", lambda e: btn.config(
+                fg=self.ACCENT if btn.cget("state") == "normal" else self.DIM))
+
+    def _place_btn(self, canvas, btn, x, ymid):
+        canvas.create_window(x, ymid, window=btn, anchor="w")
+        try:
+            btn.configure(takefocus=0)
+        except Exception:
+            pass
+        return btn
 
     # ── Canvas helper ─────────────────────────────────────────────────────────
 
@@ -834,58 +1032,102 @@ class FloatingStatusBar:
                 kw["anchor"] = anchor
             return tk.Label(root, **kw)
 
-        # ── ◀ left arrow ─────────────────────────────────────────────────────
-        btn_l = _lbl("◀", fg=self.ACCENT, cursor="hand2")
-        btn_l.bind("<Button-1>", self._prev_style)
-        btn_l.bind("<Enter>", lambda e: btn_l.config(fg="white"))
-        btn_l.bind("<Leave>", lambda e: btn_l.config(fg=self.ACCENT))
-        canvas.create_window(10, ymid, window=btn_l, anchor="w")
+        # ── Playback controls ────────────────────────────────────────────────
+        x = 8
+        self._btn_read = _lbl("Read", fg=self.ACCENT, cursor="hand2", width=4,
+                              font=self._FONTB)
+        self._bind_btn(self._btn_read, self._tb_read)
+        self._place_btn(canvas, self._btn_read, x, ymid)
+        x += 36
 
-        # ── style name (clickable — triggers rephrase) ───────────────────────────
-        self._style_var = tk.StringVar(value=REPHRASE_STYLES[self._style_idx])
-        lbl_style = _lbl(textvariable=self._style_var,
-                         font=self._FONTB, width=13, anchor="center", cursor="hand2")
-        lbl_style.bind("<Button-1>", self._trigger_rephrase)
-        lbl_style.bind("<Enter>", lambda e: lbl_style.config(fg=self.ACCENT))
-        lbl_style.bind("<Leave>", lambda e: lbl_style.config(fg=self.FG))
-        canvas.create_window(26, ymid, window=lbl_style, anchor="w")
+        canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
+        x += 6
 
-        # ── ▶ right arrow ────────────────────────────────────────────────────
-        btn_r = _lbl("▶", fg=self.ACCENT, cursor="hand2")
-        btn_r.bind("<Button-1>", self._next_style)
-        btn_r.bind("<Enter>", lambda e: btn_r.config(fg="white"))
-        btn_r.bind("<Leave>", lambda e: btn_r.config(fg=self.ACCENT))
-        canvas.create_window(118, ymid, window=btn_r, anchor="w")
+        self._btn_pause = _lbl("⏸", fg=self.DIM, cursor="hand2", width=2)
+        self._bind_btn(self._btn_pause, self._tb_pause)
+        self._place_btn(canvas, self._btn_pause, x, ymid)
+        x += 22
 
-        # ── separator ────────────────────────────────────────────────────────
-        canvas.create_line(134, 8, 134, H - 8, fill=self.SEP, width=1)
+        self._btn_resume = _lbl("▶", fg=self.DIM, cursor="hand2", width=2)
+        self._bind_btn(self._btn_resume, self._tb_resume)
+        self._place_btn(canvas, self._btn_resume, x, ymid)
+        x += 22
+
+        self._btn_stop = _lbl("⏹", fg=self.DIM, cursor="hand2", width=2)
+        self._bind_btn(self._btn_stop, self._tb_stop)
+        self._place_btn(canvas, self._btn_stop, x, ymid)
+        x += 26
+
+        canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
+        x += 6
+
+        self._btn_prev = _lbl("⏮", fg=self.DIM, cursor="hand2", width=2)
+        self._bind_btn(self._btn_prev, self._tb_prev_sentence)
+        self._place_btn(canvas, self._btn_prev, x, ymid)
+        x += 22
+
+        self._btn_next = _lbl("⏭", fg=self.DIM, cursor="hand2", width=2)
+        self._bind_btn(self._btn_next, self._tb_next_sentence)
+        self._place_btn(canvas, self._btn_next, x, ymid)
+        x += 26
+
+        canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
+        x += 6
+
+        self._btn_back = _lbl(f"-{SKIP_SECONDS}s", fg=self.DIM, cursor="hand2", width=4)
+        self._bind_btn(self._btn_back, self._tb_skip_back)
+        self._place_btn(canvas, self._btn_back, x, ymid)
+        x += 38
+
+        self._btn_fwd = _lbl(f"+{SKIP_SECONDS}s", fg=self.DIM, cursor="hand2", width=4)
+        self._bind_btn(self._btn_fwd, self._tb_skip_forward)
+        self._place_btn(canvas, self._btn_fwd, x, ymid)
+        x += 42
+
+        canvas.create_line(x, 8, x, H - 8, fill=self.SEP, width=1)
+        x += 6
 
         # ── status label ─────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="Ready")
         lbl_status = _lbl(textvariable=self._status_var,
-                          fg=self.DIM, width=14, anchor="w")
-        canvas.create_window(140, ymid, window=lbl_status, anchor="w")
+                          fg=self.DIM, width=12, anchor="w")
+        self._place_btn(canvas, lbl_status, x, ymid)
 
-        # ── gear ⚙ ───────────────────────────────────────────────────────────
+        # ── style (compact) + gear ───────────────────────────────────────────
+        self._style_var = tk.StringVar(value=REPHRASE_STYLES[self._style_idx])
+        lbl_style = _lbl(textvariable=self._style_var,
+                         font=self._FONTB, fg=self.DIM, width=10,
+                         anchor="e", cursor="hand2")
+        lbl_style.bind("<Button-1>", self._trigger_rephrase)
+        lbl_style.bind("<Enter>", lambda e: lbl_style.config(fg=self.ACCENT))
+        lbl_style.bind("<Leave>", lambda e: lbl_style.config(fg=self.DIM))
+        canvas.create_window(W - 36, ymid, window=lbl_style, anchor="e")
+        try:
+            lbl_style.configure(takefocus=0)
+        except Exception:
+            pass
+
         btn_gear = _lbl("⚙", font=("Segoe UI", 11), fg=self.DIM, cursor="hand2")
-        btn_gear.bind("<Button-1>", self._open_settings)
-        btn_gear.bind("<Enter>", lambda e: btn_gear.config(fg=self.ACCENT))
-        btn_gear.bind("<Leave>", lambda e: btn_gear.config(fg=self.DIM))
+        self._bind_btn(btn_gear, self._open_settings)
         canvas.create_window(W - 10, ymid, window=btn_gear, anchor="e")
+        try:
+            btn_gear.configure(takefocus=0)
+        except Exception:
+            pass
 
-        # Prevent all widgets from grabbing keyboard focus when clicked
-        for w in (canvas, btn_l, btn_r, btn_gear, lbl_style, lbl_status):
-            try:
-                w.configure(takefocus=0)
-            except Exception:
-                pass
+        # Prevent canvas from grabbing keyboard focus
+        try:
+            canvas.configure(takefocus=0)
+        except Exception:
+            pass
         root.attributes("-topmost", True)
 
-        # drag on background + status label (NOT on style label — it triggers rephrase)
+        # drag on background + status label
         for w in (canvas, lbl_status):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
 
+        self._refresh_playback_ui()
         root.protocol("WM_DELETE_WINDOW", lambda: None)
         root.mainloop()
 
@@ -1472,12 +1714,24 @@ class TTSWorker:
     def __init__(self):
         self._queue = queue.Queue()
         self._stop_event = threading.Event()
+        self._pause_wait = threading.Event()
+        self._pause_wait.set()
         self._speaking = False
+        self._paused = False
+        self._session_active = False
         self._voices = []
         self._voice_en = DEFAULT_VOICE_EN
         self._voice_es = DEFAULT_VOICE_ES
         self._current_speed = DEFAULT_SPEED
+        self._sentences = []
+        self._sentence_idx = 0
+        self._playhead = 0
+        self._play_gen = 0
+        self._current_sentence_audio = None
+        self._cached_sentence_idx = -1
+        self._current_sample_rate = 24000
         self.on_state_change = None
+        self.on_playback_change = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -1486,6 +1740,14 @@ class TTSWorker:
     @property
     def is_speaking(self):
         return self._speaking
+
+    @property
+    def is_active(self):
+        return self._session_active
+
+    @property
+    def is_paused(self):
+        return self._paused and self._session_active
 
     @property
     def voices(self):
@@ -1503,6 +1765,13 @@ class TTSWorker:
     def current_speed(self):
         return self._current_speed
 
+    def _notify_playback(self):
+        if self.on_playback_change:
+            try:
+                self.on_playback_change()
+            except Exception:
+                pass
+
     def speak(self, text):
         lang = detect_language(text)
         voice = self._voice_es if lang == "es" else self._voice_en
@@ -1510,13 +1779,87 @@ class TTSWorker:
         self._queue.put(("speak", (text, voice, kokoro_lang)))
 
     def speak_preview(self, text, voice, kokoro_lang):
-        """Speak a preview with an explicit voice and lang (skips detection).
-        Always queues even if currently speaking (caller should call stop() first).
-        """
+        """Speak a preview with an explicit voice and lang (skips detection)."""
         self._queue.put(("speak", (text, voice, kokoro_lang)))
 
     def stop(self):
         self._stop_event.set()
+        self._session_active = False
+        self._paused = False
+        self._pause_wait.set()
+        self._play_gen += 1
+        self._current_sentence_audio = None
+        self._cached_sentence_idx = -1
+        if self._speaking:
+            self._set_speaking(False)
+        self._notify_playback()
+
+    def pause(self):
+        if not self._session_active or self._paused:
+            return
+        self._paused = True
+        self._pause_wait.clear()
+        self._notify_playback()
+
+    def resume(self):
+        if not self._session_active or not self._paused:
+            return
+        self._paused = False
+        self._pause_wait.set()
+        self._notify_playback()
+
+    def next_sentence(self):
+        if not self._session_active:
+            return
+        if self._sentence_idx < len(self._sentences) - 1:
+            self._sentence_idx += 1
+            self._playhead = 0
+            self._current_sentence_audio = None
+            self._cached_sentence_idx = -1
+            self._play_gen += 1
+            self._paused = False
+            self._pause_wait.set()
+            self._notify_playback()
+        else:
+            self.stop()
+
+    def prev_sentence(self):
+        if not self._session_active:
+            return
+        if self._sentence_idx > 0:
+            self._sentence_idx -= 1
+            self._playhead = 0
+            self._current_sentence_audio = None
+            self._cached_sentence_idx = -1
+            self._play_gen += 1
+            self._paused = False
+            self._pause_wait.set()
+            self._notify_playback()
+        else:
+            self._playhead = 0
+            self._play_gen += 1
+            self._paused = False
+            self._pause_wait.set()
+            self._notify_playback()
+
+    def skip_seconds(self, delta):
+        if not self._session_active:
+            return
+        audio = self._current_sentence_audio
+        if audio is None or len(audio) == 0:
+            return
+        sr = self._current_sample_rate or 24000
+        new_head = self._playhead + int(delta * sr)
+        if new_head < 0:
+            new_head = 0
+        if new_head >= len(audio):
+            self.next_sentence()
+            return
+        self._playhead = new_head
+        self._play_gen += 1
+        self._paused = False
+        self._pause_wait.set()
+        self._notify_playback()
 
     def set_voice_en(self, voice):
         self._queue.put(("set_voice_en", voice))
@@ -1539,7 +1882,6 @@ class TTSWorker:
                 pass
 
     def _run(self):
-        # Use CUDA with fp16 model if available, otherwise CPU with int8
         if USE_GPU:
             use_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             model_path = MODEL_PATH_FP16
@@ -1551,24 +1893,19 @@ class TTSWorker:
         session = ort.InferenceSession(model_path, providers=use_providers)
         kokoro = Kokoro.from_session(session, VOICES_PATH)
 
-        # Read available voice names from the NPZ file
         data = np.load(VOICES_PATH)
         self._voices = sorted(data.files)
         data.close()
 
-        # Warm up ONNX runtime so first real request is fast
         asyncio.run(self._warmup(kokoro))
 
         while True:
-            cmd, arg = self._queue.get()  # block until command arrives
+            cmd, arg = self._queue.get()
 
             try:
                 if cmd == "speak":
                     text, voice, kokoro_lang = arg
-                    self._stop_event.clear()
-                    self._set_speaking(True)
-                    asyncio.run(self._speak_stream(kokoro, text, voice, kokoro_lang))
-                    self._set_speaking(False)
+                    self._speak_session(kokoro, text, voice, kokoro_lang)
 
                 elif cmd == "set_voice_en":
                     self._voice_en = arg
@@ -1584,36 +1921,107 @@ class TTSWorker:
 
             except Exception as e:
                 print(f"TTS error: {e}", file=sys.stderr)
+                self._session_active = False
                 self._set_speaking(False)
+                self._notify_playback()
+
+    def _speak_session(self, kokoro, text, voice, kokoro_lang):
+        self._sentences = split_sentences(text)
+        if not self._sentences:
+            return
+
+        self._sentence_idx = 0
+        self._playhead = 0
+        self._session_active = True
+        self._stop_event.clear()
+        self._paused = False
+        self._pause_wait.set()
+        self._current_sentence_audio = None
+        self._cached_sentence_idx = -1
+        self._set_speaking(True)
+        self._notify_playback()
+
+        while self._session_active and self._sentence_idx < len(self._sentences):
+            if self._stop_event.is_set():
+                break
+
+            if self._cached_sentence_idx != self._sentence_idx:
+                sent = self._sentences[self._sentence_idx]
+                audio, sr = asyncio.run(
+                    self._synthesize_sentence(kokoro, sent, voice, kokoro_lang)
+                )
+                self._current_sentence_audio = audio
+                self._cached_sentence_idx = self._sentence_idx
+                self._current_sample_rate = sr
+
+            audio = self._current_sentence_audio
+            if audio is None or len(audio) == 0:
+                self._sentence_idx += 1
+                self._playhead = 0
+                self._cached_sentence_idx = -1
+                continue
+
+            gen = self._play_gen
+            completed = self._play_audio_buffer(
+                audio, self._current_sample_rate, self._playhead, gen
+            )
+
+            if self._stop_event.is_set():
+                break
+            if self._play_gen != gen:
+                continue
+            if not completed:
+                break
+
+            self._sentence_idx += 1
+            self._playhead = 0
+            self._cached_sentence_idx = -1
+
+        self._session_active = False
+        self._paused = False
+        self._pause_wait.set()
+        self._current_sentence_audio = None
+        self._set_speaking(False)
+        self._notify_playback()
 
     async def _warmup(self, kokoro):
-        """Run a tiny inference to pre-warm ONNX runtime."""
         async for _, _ in kokoro.create_stream(".", voice=self._voice_en, speed=1.0, lang="en-us"):
-            break  # only need the first chunk
+            break
 
-    async def _speak_stream(self, kokoro, text, voice, kokoro_lang):
+    async def _synthesize_sentence(self, kokoro, text, voice, kokoro_lang):
+        chunks = []
+        sample_rate = 24000
         stream = kokoro.create_stream(
             text, voice=voice, speed=self._current_speed, lang=kokoro_lang
         )
         async for samples, sample_rate in stream:
             if self._stop_event.is_set():
                 break
-            if not self._play_audio(samples, sample_rate):
-                break
+            chunks.append(np.asarray(samples, dtype=np.float32))
+        if not chunks:
+            return np.array([], dtype=np.float32), sample_rate
+        return np.concatenate(chunks), sample_rate
 
-    def _play_audio(self, samples, sample_rate):
-        """Play audio with 50ms stop-check granularity."""
+    def _play_audio_buffer(self, samples, sample_rate, start_sample, generation):
+        """Play audio with pause, stop, and seek support."""
         samples = np.asarray(samples, dtype=np.float32)
-        chunk_size = int(sample_rate * AUDIO_CHUNK_SECS)
+        chunk_size = max(1, int(sample_rate * AUDIO_CHUNK_SECS))
         try:
             with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32") as out:
-                i = 0
+                i = start_sample
                 while i < len(samples):
-                    if self._stop_event.is_set():
+                    if self._stop_event.is_set() or self._play_gen != generation:
                         return False
+                    while self._paused:
+                        self._pause_wait.wait(timeout=0.05)
+                        if self._stop_event.is_set() or self._play_gen != generation:
+                            return False
+                    if self._playhead != i:
+                        i = min(self._playhead, len(samples))
                     end = min(i + chunk_size, len(samples))
                     out.write(samples[i:end].reshape(-1, 1))
                     i = end
+                    self._playhead = i
         except Exception as e:
             print(f"Audio playback error: {e}", file=sys.stderr)
             return False
@@ -1644,6 +2052,7 @@ class TinyReadAloud:
         self.tts._voice_es = cfg["voice_es"]
         self.tts._current_speed = cfg["speed"]
         self.tts.on_state_change = self._on_speaking_changed
+        self.tts.on_playback_change = self._on_playback_changed
         self.icon = None
         self._hotkey_handle = None
         self._dictation_hotkey_handle = None
@@ -1675,6 +2084,21 @@ class TinyReadAloud:
         )
         self.icon.run(setup=self._on_ready)
 
+    def _safe_add_hotkey(self, hotkey, callback, label):
+        if not hotkey:
+            return None
+        try:
+            return keyboard.add_hotkey(hotkey, callback, suppress=False)
+        except Exception as e:
+            print(f"[Hotkey] Failed to register {label} ({hotkey}): {e}", flush=True)
+            if self.icon:
+                self.icon.notify(
+                    f"Could not register {label} hotkey ({hotkey}). "
+                    "Try running as administrator or change the shortcut in Settings.",
+                    "TinyReadAloud",
+                )
+            return None
+
     def _on_ready(self, icon):
         icon.visible = True
         self.tts.start()
@@ -1682,20 +2106,14 @@ class TinyReadAloud:
         time.sleep(1.0)  # give Kokoro time to load
         icon.menu = self._build_menu()
         icon.update_menu()
-        if self._hotkey:
-            self._hotkey_handle = keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=False)
-        if self._dictation_hotkey:
-            self._dictation_hotkey_handle = keyboard.add_hotkey(
-                self._dictation_hotkey, self._on_dictation_hotkey, suppress=False
-            )
-        if self._grammar_hotkey:
-            self._grammar_hotkey_handle = keyboard.add_hotkey(
-                self._grammar_hotkey, self._on_grammar_hotkey, suppress=False
-            )
-        if self._rephrase_hotkey:
-            self._rephrase_hotkey_handle = keyboard.add_hotkey(
-                self._rephrase_hotkey, self._on_rephrase_hotkey, suppress=False
-            )
+        self._hotkey_handle = self._safe_add_hotkey(
+            self._hotkey, self._on_hotkey, "read")
+        self._dictation_hotkey_handle = self._safe_add_hotkey(
+            self._dictation_hotkey, self._on_dictation_hotkey, "dictation")
+        self._grammar_hotkey_handle = self._safe_add_hotkey(
+            self._grammar_hotkey, self._on_grammar_hotkey, "grammar")
+        self._rephrase_hotkey_handle = self._safe_add_hotkey(
+            self._rephrase_hotkey, self._on_rephrase_hotkey, "rephrase")
         self._register_style_hotkeys()
         FloatingStatusBar.open(self)
         self._status_bar = FloatingStatusBar.get()
@@ -1707,12 +2125,45 @@ class TinyReadAloud:
         threading.Timer(5.0, self._check_for_updates_background).start()
 
     def _build_menu(self):
+        playback_active = lambda item: self.tts.is_active
         items = [
             pystray.MenuItem(
-                "Stop Reading",
-                self._cmd_stop,
-                enabled=lambda item: self.tts.is_speaking,
+                "Pause",
+                self._cmd_pause,
+                enabled=lambda item: self.tts.is_active and not self.tts.is_paused,
             ),
+            pystray.MenuItem(
+                "Resume",
+                self._cmd_resume,
+                enabled=lambda item: self.tts.is_paused,
+            ),
+            pystray.MenuItem(
+                "Stop",
+                self._cmd_stop,
+                enabled=playback_active,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Next Sentence",
+                self._cmd_next_sentence,
+                enabled=playback_active,
+            ),
+            pystray.MenuItem(
+                "Previous Sentence",
+                self._cmd_prev_sentence,
+                enabled=playback_active,
+            ),
+            pystray.MenuItem(
+                f"Skip +{SKIP_SECONDS} sec",
+                self._cmd_skip_forward,
+                enabled=playback_active,
+            ),
+            pystray.MenuItem(
+                f"Skip -{SKIP_SECONDS} sec",
+                self._cmd_skip_back,
+                enabled=playback_active,
+            ),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Stop Dictation" if self._dictation_listening else "Start Dictation",
                 self._cmd_toggle_dictation,
@@ -1798,8 +2249,30 @@ class TinyReadAloud:
         return setter
 
     def _on_hotkey(self):
-        self.tts.stop()
-        threading.Thread(target=self._capture_and_speak, daemon=True).start()
+        target_hwnd = user32.GetForegroundWindow()
+        if self._status_bar is not None:
+            if target_hwnd == self._status_bar._own_hwnd:
+                target_hwnd = self._status_bar._last_target_hwnd or target_hwnd
+            elif self._status_bar._last_target_hwnd:
+                target_hwnd = self._status_bar._last_target_hwnd
+        self.start_read(target_hwnd)
+
+    def start_read(self, target_hwnd=None):
+        """Start reading selection, or stop if already playing."""
+        if self.tts.is_active:
+            self.tts.stop()
+            return
+        if not target_hwnd:
+            target_hwnd = (
+                self._status_bar._last_target_hwnd
+                if self._status_bar is not None
+                else user32.GetForegroundWindow()
+            ) or user32.GetForegroundWindow()
+        threading.Thread(
+            target=self._capture_and_speak,
+            args=(target_hwnd,),
+            daemon=True,
+        ).start()
 
     def _on_dictation_hotkey(self):
         threading.Thread(target=self._toggle_dictation, daemon=True).start()
@@ -1915,19 +2388,39 @@ class TinyReadAloud:
         self._rephrase_thread = t
         t.start()
 
-    def _capture_and_speak(self):
-        text = capture_selected_text()
-        if text:
-            self.tts.speak(text)
+    def _capture_and_speak(self, target_hwnd=None):
+        if not target_hwnd:
+            target_hwnd = (
+                self._status_bar._last_target_hwnd
+                if self._status_bar is not None
+                else user32.GetForegroundWindow()
+            ) or user32.GetForegroundWindow()
+        print(f"[Read] Hotkey fired. target_hwnd={target_hwnd:#010x}", flush=True)
+
+        text = capture_selected_text(target_hwnd)
+        print(f"[Read] Captured {len(text)} chars.", flush=True)
+
+        if not text:
+            self._set_status("Nothing selected.")
+            if self.icon:
+                self.icon.notify(
+                    "No text captured. Highlight text in your editor first, "
+                    "then click Read or press Ctrl+Alt+R.",
+                    "TinyReadAloud",
+                )
+            return
+
+        self._reset_hotkeys()
+        self.tts.speak(text)
 
     def _on_speaking_changed(self, is_speaking):
         if self.icon:
             self.icon.icon = (
                 self._icon_speaking if is_speaking else self._icon_idle
             )
-        self._set_status("Speaking…" if is_speaking else "Ready")
-        # Any-key-stops-playback
-        if is_speaking:
+        self._update_playback_status()
+        # Any-key-stops-playback (not while paused)
+        if is_speaking and not self.tts.is_paused:
             self._speaking_since = time.monotonic()
             try:
                 self._anykey_hook = keyboard.on_press(self._on_anykey_stop)
@@ -1958,10 +2451,37 @@ class TinyReadAloud:
                     self._grammar_thread = t
                     t.start()
 
+    def _on_playback_changed(self):
+        self._update_playback_status()
+        if self._status_bar is not None:
+            self._status_bar.update_playback_controls()
+        if self.icon:
+            try:
+                self.icon.update_menu()
+            except Exception:
+                pass
+
+    def _update_playback_status(self):
+        if self.tts.is_paused:
+            self._set_status("Paused")
+        elif self.tts.is_active:
+            self._set_status("Speaking…")
+        else:
+            self._set_status("Ready")
+
     def _on_anykey_stop(self, event):
         """Stop TTS playback when any key is pressed."""
-        if time.monotonic() - self._speaking_since < 0.5:
+        if self.tts.is_paused:
+            return
+        if time.monotonic() - self._speaking_since < 1.0:
             return  # ignore keys from the hotkey that triggered playback
+        name = (getattr(event, "name", "") or "").lower()
+        if name in {
+            "ctrl", "alt", "shift",
+            "left ctrl", "right ctrl", "left alt", "right alt",
+            "left shift", "right shift",
+        }:
+            return
         self._stopped_by_key = True
         self.tts.stop()
 
@@ -1990,6 +2510,24 @@ class TinyReadAloud:
         self.tts.stop()
         self._grammar_cancel.set()
         self._rephrase_cancel.set()
+
+    def _cmd_pause(self, icon, item):
+        self.tts.pause()
+
+    def _cmd_resume(self, icon, item):
+        self.tts.resume()
+
+    def _cmd_next_sentence(self, icon, item):
+        self.tts.next_sentence()
+
+    def _cmd_prev_sentence(self, icon, item):
+        self.tts.prev_sentence()
+
+    def _cmd_skip_forward(self, icon, item):
+        self.tts.skip_seconds(SKIP_SECONDS)
+
+    def _cmd_skip_back(self, icon, item):
+        self.tts.skip_seconds(-SKIP_SECONDS)
 
     def _cmd_toggle_dictation(self, icon, item):
         self._toggle_dictation()
