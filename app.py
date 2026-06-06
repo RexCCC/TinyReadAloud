@@ -18,6 +18,7 @@ import urllib.request
 
 from capture_fallbacks import capture_via_accessibility, capture_ocr_region
 from ocr_region import RegionSelectOverlay
+from reliability import log_event, log_exception, new_trace_id, run_health_check
 from version import __version__
 
 # Per-monitor DPI so Tk mouse coords match mss screenshots (multi-monitor + scaling).
@@ -2263,6 +2264,8 @@ class TinyReadAloud:
         self._dictation_started_at = 0
         self._icon_idle = create_tray_icon(speaking=False)
         self._icon_speaking = create_tray_icon(speaking=True)
+        self._health_report = None
+        self._ocr_in_progress = False
 
     def run(self):
         self.icon = pystray.Icon(
@@ -2308,12 +2311,40 @@ class TinyReadAloud:
         self._register_style_hotkeys()
         FloatingStatusBar.open(self)
         self._status_bar = FloatingStatusBar.get()
+        threading.Thread(target=self._run_startup_health_check, daemon=True).start()
         print(
             f"TinyReadAloud v{__version__} ready. "
             f"Read: {self._hotkey} | OCR: {self._ocr_hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}"
         )
         # Check for updates in background after 5 seconds
         threading.Timer(5.0, self._check_for_updates_background).start()
+
+    def _run_startup_health_check(self):
+        try:
+            self._health_report = run_health_check(include_clipboard=False)
+            if not self._health_report.ok and self.icon:
+                self.icon.notify(
+                    f"OCR may not work: {self._health_report.summary()}",
+                    "TinyReadAloud",
+                )
+        except Exception as exc:
+            log_exception("Health", exc)
+
+    def _ocr_user_message(self, result) -> str:
+        err = (result.error or "").lower()
+        if "language" in err or "engine" in err:
+            return (
+                "Windows OCR is not available. Add an English language pack "
+                "in Settings → Time & language → Language."
+            )
+        if err == "screenshot_failed":
+            return "Could not capture that screen region. Try again on a visible area."
+        if err == "winrt_not_installed":
+            return "OCR packages missing. Run: pip install -r requirements.txt"
+        return (
+            "OCR found no text. Select a larger area with clear text. "
+            f"Debug crop saved under %LOCALAPPDATA%\\TinyReadAloud\\ocr_debug"
+        )
 
     def _build_menu(self):
         playback_active = lambda item: self.tts.is_active
@@ -2471,8 +2502,18 @@ class TinyReadAloud:
 
     def start_ocr_read(self):
         """Dim screen and let the user drag a region to OCR and read."""
+        if self._ocr_in_progress:
+            self._set_status("OCR already in progress…")
+            return
+        if self._health_report is not None and not self._health_report.ok:
+            msg = self._health_report.summary()
+            self._set_status("OCR unavailable.")
+            if self.icon:
+                self.icon.notify(msg, "TinyReadAloud — OCR")
+            return
         if self.tts.is_active:
             self.tts.stop()
+        self._ocr_in_progress = True
         parent = None
         if self._status_bar and self._status_bar._root:
             self._status_bar.prepare_for_ocr_overlay()
@@ -2480,34 +2521,44 @@ class TinyReadAloud:
         RegionSelectOverlay.pick(self._on_ocr_region_picked, parent_root=parent)
 
     def _on_ocr_region_picked(self, bbox):
-        if self._status_bar:
-            self._status_bar.restore_after_ocr_overlay()
-        if not bbox:
-            self._set_status("OCR cancelled.")
-            return
-        threading.Thread(
-            target=self._ocr_region_and_speak,
-            args=(bbox,),
-            daemon=True,
-        ).start()
+        try:
+            if not bbox:
+                self._set_status("OCR cancelled.")
+                return
+            threading.Thread(
+                target=self._ocr_region_and_speak,
+                args=(bbox,),
+                daemon=True,
+            ).start()
+        finally:
+            self._ocr_in_progress = False
+            if self._status_bar:
+                self._status_bar.restore_after_ocr_overlay()
 
     def _ocr_region_and_speak(self, bbox):
-        # Let overlay and toolbar fully disappear before grabbing pixels.
-        time.sleep(0.2)
-        self._set_status("OCR scanning…")
-        text = capture_ocr_region(bbox)
-        print(f"[OCR] region captured {len(text)} chars.", flush=True)
-        if not text:
-            self._set_status("No text in region.")
+        trace_id = new_trace_id()
+        log_event("OCR", "region start", trace_id=trace_id, bbox=bbox)
+        try:
+            time.sleep(0.25)
+            self._set_status("OCR scanning…")
+            result = capture_ocr_region(bbox, trace_id=trace_id)
+            log_event(
+                "OCR", "region done",
+                trace_id=trace_id, ok=result.ok, attempts=result.attempts,
+            )
+            if not result.ok:
+                self._set_status("No text in region.")
+                if self.icon:
+                    self.icon.notify(self._ocr_user_message(result), "TinyReadAloud")
+                return
+            self._set_status("Read (OCR)…")
+            self._reset_hotkeys()
+            self.tts.speak(result.text)
+        except Exception as exc:
+            log_exception("OCR", exc, trace_id)
+            self._set_status("OCR error.")
             if self.icon:
-                self.icon.notify(
-                    "OCR found no text in that region. Try a larger selection.",
-                    "TinyReadAloud",
-                )
-            return
-        self._set_status("Read (OCR)…")
-        self._reset_hotkeys()
-        self.tts.speak(text)
+                self.icon.notify(f"OCR error: {exc}", "TinyReadAloud")
 
     def start_read(self, target_hwnd=None):
         """Start reading selection, or stop if already playing."""
@@ -2641,33 +2692,40 @@ class TinyReadAloud:
         t.start()
 
     def _capture_and_speak(self, target_hwnd=None):
-        if not target_hwnd:
-            target_hwnd = (
-                self._status_bar._last_target_hwnd
-                if self._status_bar is not None
-                else user32.GetForegroundWindow()
-            ) or user32.GetForegroundWindow()
-        print(f"[Read] Hotkey fired. target_hwnd={target_hwnd:#010x}", flush=True)
+        trace_id = new_trace_id()
+        try:
+            if not target_hwnd:
+                target_hwnd = (
+                    self._status_bar._last_target_hwnd
+                    if self._status_bar is not None
+                    else user32.GetForegroundWindow()
+                ) or user32.GetForegroundWindow()
+            log_event("Read", "capture start", trace_id=trace_id, hwnd=f"{target_hwnd:#010x}")
 
-        self._set_status("Capturing text…")
-        text = capture_selected_text(target_hwnd)
-        if not text:
-            self._set_status("Trying accessibility…")
-            text = capture_via_accessibility(target_hwnd)
-        print(f"[Read] Captured {len(text)} chars.", flush=True)
+            self._set_status("Capturing text…")
+            text = capture_selected_text(target_hwnd)
+            if not text:
+                self._set_status("Trying accessibility…")
+                text = capture_via_accessibility(target_hwnd)
+            log_event("Read", "capture done", trace_id=trace_id, chars=len(text))
 
-        if not text:
-            self._set_status("Nothing selected.")
+            if not text:
+                self._set_status("Nothing selected.")
+                if self.icon:
+                    self.icon.notify(
+                        "No text captured. Highlight text first, or use OCR "
+                        f"({self._ocr_hotkey} or toolbar OCR button).",
+                        "TinyReadAloud",
+                    )
+                return
+
+            self._reset_hotkeys()
+            self.tts.speak(text)
+        except Exception as exc:
+            log_exception("Read", exc, trace_id)
+            self._set_status("Read error.")
             if self.icon:
-                self.icon.notify(
-                    "No text captured. Highlight text first, or use OCR "
-                    f"({self._ocr_hotkey} or toolbar OCR button).",
-                    "TinyReadAloud",
-                )
-            return
-
-        self._reset_hotkeys()
-        self.tts.speak(text)
+                self.icon.notify(f"Read failed: {exc}", "TinyReadAloud")
 
     def _on_speaking_changed(self, is_speaking):
         if self.icon:

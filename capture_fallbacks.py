@@ -6,8 +6,12 @@ import asyncio
 import ctypes
 import ctypes.wintypes
 import io
+import os
 import re
 import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
 
 user32 = ctypes.windll.user32
 
@@ -17,6 +21,62 @@ user32.ClientToScreen.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wi
 user32.ClientToScreen.restype = ctypes.wintypes.BOOL
 user32.IsWindow.argtypes = [ctypes.wintypes.HWND]
 user32.IsWindow.restype = ctypes.wintypes.BOOL
+
+
+@dataclass
+class OcrCaptureResult:
+    text: str
+    error: str = ""
+    attempts: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.text)
+
+
+def _debug_dir():
+    base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
+    path = os.path.join(base, "TinyReadAloud", "ocr_debug")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _save_debug_image(image, tag: str):
+    """Save last failed OCR crop for post-mortem (max 5 files)."""
+    try:
+        folder = _debug_dir()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(folder, f"{tag}_{ts}.png")
+        image.save(path)
+        existing = sorted(
+            (f for f in os.listdir(folder) if f.endswith(".png")),
+            reverse=True,
+        )
+        for old in existing[5:]:
+            try:
+                os.remove(os.path.join(folder, old))
+            except OSError:
+                pass
+        print(f"[Capture] debug image saved: {path}", flush=True)
+    except Exception as exc:
+        print(f"[Capture] debug save failed: {exc}", flush=True)
+
+
+def _preprocess_for_ocr(image, mode: str = "default"):
+    """Improve OCR hit rate on UI text and scanned content."""
+    from PIL import ImageEnhance, ImageFilter, ImageOps
+
+    if mode == "raw":
+        return image.convert("RGB")
+
+    gray = ImageOps.grayscale(image)
+    if mode == "high_contrast":
+        gray = ImageEnhance.Contrast(gray).enhance(2.0)
+        gray = ImageEnhance.Sharpness(gray).enhance(1.5)
+    else:
+        gray = ImageEnhance.Contrast(gray).enhance(1.4)
+        gray = gray.filter(ImageFilter.SHARPEN)
+    return gray.convert("RGB")
 
 
 def reflow_ocr_text(raw: str) -> str:
@@ -213,33 +273,34 @@ async def _ocr_pil_async(pil_image) -> str:
     return (result.text or "").strip()
 
 
-def ocr_pil_image(pil_image) -> str:
+def ocr_pil_image(pil_image, preprocess: str = "default") -> str:
     if sys.platform != "win32":
         return ""
+    img = _preprocess_for_ocr(pil_image, preprocess)
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_ocr_pil_async(pil_image))
+        return loop.run_until_complete(_ocr_pil_async(img))
     finally:
         loop.close()
         asyncio.set_event_loop(None)
 
 
-def capture_ocr_region(bbox) -> str:
-    """OCR a screen rectangle (left, top, width, height). Returns reflowed text."""
+def capture_ocr_region(bbox, trace_id: str = "") -> OcrCaptureResult:
+    """OCR a screen rectangle with retries and preprocessing variants."""
+    tag = trace_id or "ocr"
     if not bbox:
-        return ""
+        return OcrCaptureResult("", error="no_bbox")
 
     try:
         from winrt.windows.media.ocr import OcrEngine  # noqa: F401
     except ImportError:
-        print("[Capture] winrt OCR packages not installed — skip OCR", flush=True)
-        return ""
+        return OcrCaptureResult("", error="winrt_not_installed")
 
     left, top, width, height = bbox
     image = _screenshot_bbox(left, top, width, height)
     if image is None:
-        return ""
+        return OcrCaptureResult("", error="screenshot_failed")
 
     # Upscale small captures — OCR accuracy improves with pixel density.
     try:
@@ -253,14 +314,37 @@ def capture_ocr_region(bbox) -> str:
     except Exception:
         pass
 
-    try:
-        raw = ocr_pil_image(image)
-        text = reflow_ocr_text(raw)
-        if text:
-            print(f"[Capture] region OCR ok len={len(text)}", flush=True)
-        else:
-            print("[Capture] region OCR returned no text", flush=True)
-        return text
-    except Exception as exc:
-        print(f"[Capture] region OCR failed: {exc}", flush=True)
-        return ""
+    variants = ("default", "high_contrast", "raw")
+    last_error = ""
+    for attempt, variant in enumerate(variants, start=1):
+        try:
+            raw = ocr_pil_image(image, preprocess=variant)
+            text = reflow_ocr_text(raw)
+            if text:
+                print(
+                    f"[Capture] region OCR ok len={len(text)} "
+                    f"attempt={attempt} variant={variant}",
+                    flush=True,
+                )
+                return OcrCaptureResult(text, attempts=attempt)
+            last_error = "empty_result"
+            print(
+                f"[Capture] OCR empty attempt={attempt} variant={variant}",
+                flush=True,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            print(
+                f"[Capture] OCR failed attempt={attempt} variant={variant}: {exc}",
+                flush=True,
+            )
+        if attempt < len(variants):
+            time.sleep(0.1)
+
+    _save_debug_image(image, tag)
+    return OcrCaptureResult("", error=last_error or "no_text", attempts=len(variants))
+
+
+def capture_ocr_region_text(bbox, trace_id: str = "") -> str:
+    """Backward-compatible wrapper returning text only."""
+    return capture_ocr_region(bbox, trace_id=trace_id).text

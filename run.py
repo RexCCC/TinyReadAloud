@@ -136,6 +136,14 @@ def main():
     sys.stderr = log_file
     print(f"\n--- TinyReadAloud start pid={os.getpid()} ---", flush=True)
 
+    try:
+        from reliability import run_health_check
+        report = run_health_check(include_clipboard=False)
+        if not report.ok:
+            print(f"Preflight warning: {report.summary()}", flush=True)
+    except Exception as exc:
+        print(f"Preflight skipped: {exc}", flush=True)
+
     if not _acquire_instance_lock():
         print("Another instance is already running; exiting.", flush=True)
         _notify_already_running()

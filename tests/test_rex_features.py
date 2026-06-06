@@ -162,7 +162,21 @@ class TestWindowsOcr(unittest.TestCase):
             mon = sct.monitors[1]
         bbox = (mon["left"] + 5, mon["top"] + 5, 300, 120)
         result = cap_mod.capture_ocr_region(bbox)
-        self.assertIsInstance(result, str)
+        self.assertIsInstance(result, cap_mod.OcrCaptureResult)
+
+
+class TestReliability(unittest.TestCase):
+    def test_health_check_runs(self):
+        import reliability as rel
+        report = rel.run_health_check(include_clipboard=False)
+        self.assertIsInstance(report.checks, list)
+        self.assertGreater(len(report.checks), 0)
+
+    def test_ocr_result_dataclass(self):
+        ok = cap_mod.OcrCaptureResult("hello", attempts=1)
+        self.assertTrue(ok.ok)
+        bad = cap_mod.OcrCaptureResult("", error="empty")
+        self.assertFalse(bad.ok)
 
 
 class TestDependencies(unittest.TestCase):

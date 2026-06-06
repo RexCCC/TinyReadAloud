@@ -173,3 +173,5 @@ class RegionSelectOverlay:
             on_result(result["bbox"])
         except Exception as exc:
             print(f"[OCR] region callback failed: {exc}", flush=True)
+            import traceback
+            traceback.print_exc()
